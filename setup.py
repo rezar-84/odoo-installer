@@ -94,6 +94,7 @@ def save_state(state):
     Excludes passwords and API tokens.
     """
     state_copy = dict(state)
+    # Remove known sensitive keys
     state_copy.pop('db_pass', None)
     state_copy.pop('api_token', None)
     try:
@@ -143,31 +144,37 @@ def user_exists(user_name):
 def apt_install(pkg_list):
     """
     Attempt 'apt install -y <pkg_list>'.
-    If it fails, prompt to run 'apt --fix-broken install', then re-attempt.
+    If it fails, we detect the return code. If it's code 100 (broken packages),
+    we prompt the user about trying 'apt --fix-broken install', then re-attempt.
+
     Returns True if final install is successful, False otherwise.
     """
     stdout, stderr, rc = run_cmd(f"apt install -y {pkg_list}", capture_output=True)
     if rc == 0:
         return True
 
-    # If we got here, apt failed
-    log("[ERROR] apt install failed. Attempt fix-broken approach?")
-    fix_choice = input("Attempt 'apt --fix-broken install'? (y/n): ").strip().lower()
-    if fix_choice == 'y':
-        _, _, rc2 = run_cmd("apt --fix-broken install -y", capture_output=True)
-        if rc2 == 0:
-            # re-attempt
-            _, _, rc3 = run_cmd(f"apt install -y {pkg_list}", capture_output=True)
-            if rc3 == 0:
-                return True
+    # If apt failed
+    if rc == 100:
+        log("[ERROR] apt install encountered broken packages. Attempt fix-broken approach?")
+        fix_choice = input("Attempt 'apt --fix-broken install'? (y/n): ").strip().lower()
+        if fix_choice == 'y':
+            _, _, rc2 = run_cmd("apt --fix-broken install -y", capture_output=True)
+            if rc2 == 0:
+                # re-attempt original
+                _, _, rc3 = run_cmd(f"apt install -y {pkg_list}", capture_output=True)
+                if rc3 == 0:
+                    return True
+                else:
+                    log(f"[ERROR] apt install of {pkg_list} still failed after fix-broken.")
+                    return False
             else:
-                log(f"[ERROR] apt install of {pkg_list} still failed after fix-broken.")
+                log("[ERROR] fix-broken also failed.")
                 return False
         else:
-            log("[ERROR] fix-broken also failed.")
+            log("[WARN] Skipping fix-broken. apt install remains failed.")
             return False
     else:
-        log("[WARN] Skipping fix-broken. apt install remains failed.")
+        log(f"[ERROR] apt install of {pkg_list} failed with code {rc}. No fix-broken attempt.")
         return False
 
 ########################################
@@ -186,7 +193,6 @@ def check_python_version():
                 min = int(min)
                 if (maj == 3 and min >= 11) or (maj > 3):
                     log(f"[OK] Detected Python {maj}.{min}.")
-                    return
                 else:
                     log(f"[WARN] Python {maj}.{min} is lower than 3.11.")
             except:
@@ -201,6 +207,16 @@ def check_python_version():
 ########################################
 
 def prompt_install_dependencies():
+    """
+    Prompts the user to install typical system dependencies for Odoo 18.
+    This includes:
+    - Git, curl, wget, nano, build-essential
+    - PostgreSQL + dev libs
+    - NodeJS + npm + yarn
+    - wkhtmltopdf
+    - Nginx
+    - etc.
+    """
     log("Prompting user to install system dependencies.")
     print("""
 We'll install required packages for Odoo 18 on Ubuntu 24.04, including:
@@ -229,7 +245,7 @@ Install dependencies now?
     # Attempt main packages
     ok = apt_install(base_deps)
     if not ok:
-        log("[ERROR] Base dependencies failed to install. Aborting or skipping further steps.")
+        log("[ERROR] Base dependencies failed to install. Some steps may fail later.")
         return
 
     # NodeSource script
@@ -250,7 +266,7 @@ Install dependencies now?
         log("[ERROR] Yarn installation failed. Some Odoo assets might not build.")
         return
 
-    log("[OK] Dependencies installed (with potential warnings if partial failures).")
+    log("[OK] Dependencies installed (with possible partial success).")
 
 ########################################
 # Step: Configure Database
@@ -272,7 +288,7 @@ PostgreSQL Database Configuration
     db_user = input("Enter DB user (default: odoo): ").strip() or "odoo"
     db_pass = input("Enter DB password (default: odoo): ").strip() or "odoo"
 
-    # store in state (we do store db_pass in memory, won't save to JSON)
+    # store in state
     state['db_name'] = db_name
     state['db_user'] = db_user
     state['db_pass'] = db_pass
@@ -280,13 +296,15 @@ PostgreSQL Database Configuration
     run_cmd("systemctl enable postgresql && systemctl start postgresql")
 
     def db_exists(db):
-        out, err, rc = run_cmd(f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='{db}'\"",
-                               capture_output=True)
+        out, err, rc = run_cmd(
+            f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='{db}'\"",
+            capture_output=True)
         return out.strip() == "1"
 
     def db_user_exists(user):
-        out, err, rc = run_cmd(f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{user}'\"",
-                               capture_output=True)
+        out, err, rc = run_cmd(
+            f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{user}'\"",
+            capture_output=True)
         return out.strip() == "1"
 
     if db_user_exists(db_user):
@@ -319,10 +337,19 @@ PostgreSQL Database Configuration
     log("[INFO] Database configuration complete.")
 
 ########################################
-# Step: Setup / Update Odoo
+# Step: Setup / Update Odoo (Cloning)
 ########################################
 
 def setup_odoo(state):
+    """
+    Sets up / updates Odoo code:
+    - Asks for Odoo version (default 18.0)
+    - Install path (default /opt/odoo18)
+    - System user (default 'odoo')
+    - Optionally create a Python virtual environment
+    - If the directory has .git, we prompt about reusing or re-cloning
+    - If .git is missing, we also prompt the user
+    """
     log("Setting up / updating Odoo source code.")
     print("\n==== Odoo Setup / Update ====")
     default_ver = state.get('odoo_ver', '18.0')
@@ -437,6 +464,18 @@ def install_requirements_system(install_path):
 # Step: Memory Worker Config
 ########################################
 
+def detect_system_memory_mb():
+    try:
+        with open("/proc/meminfo") as f:
+            data = f.read()
+        match = re.search(r"^MemTotal:\s+(\d+)\skB", data, re.MULTILINE)
+        if match:
+            mem_kb = int(match.group(1))
+            return mem_kb // 1024
+    except:
+        pass
+    return 0
+
 def prompt_odoo_memory_config(state):
     log("Prompting for Odoo memory-based worker config.")
     mem = detect_system_memory_mb()
@@ -460,18 +499,6 @@ def prompt_odoo_memory_config(state):
     state['workers'] = workers
     log(f"[OK] Set workers to {workers} (in state only).")
 
-def detect_system_memory_mb():
-    try:
-        with open("/proc/meminfo") as f:
-            data = f.read()
-        match = re.search(r"^MemTotal:\s+(\d+)\skB", data, re.MULTILINE)
-        if match:
-            mem_kb = int(match.group(1))
-            return mem_kb // 1024
-    except:
-        pass
-    return 0
-
 ########################################
 # Step: Advanced PostgreSQL Tuning
 ########################################
@@ -488,6 +515,7 @@ Example: 2GB, 16MB, 64MB
     if c != 'y':
         return
 
+    # Typically /etc/postgresql/16/main on Ubuntu 24.04
     pg_conf = "/etc/postgresql/16/main/postgresql.conf"
     if not os.path.isfile(pg_conf):
         pg_conf = "/etc/postgresql/14/main/postgresql.conf"
@@ -541,7 +569,6 @@ def configure_odoo(state):
     print("\n===== Odoo Configuration =====")
     admin_passwd = input("Master (admin) password? (default: admin): ").strip() or "admin"
 
-    # If db wasn't set up, let them override
     db_host = "localhost"
     db_port = "5432"
 
@@ -561,8 +588,8 @@ We have optional memory/time limits.
         limit_time_real  = input("limit_time_real (sec)? (default 120): ").strip() or "120"
         limit_request    = input("limit_request? (default 8192): ").strip() or "8192"
     else:
-        limit_memory_hard = "2147483648"   # 2GB
-        limit_memory_soft = "1073741824"   # 1GB
+        limit_memory_hard = "2147483648"  # 2GB
+        limit_memory_soft = "1073741824"  # 1GB
         limit_time_cpu   = "60"
         limit_time_real  = "120"
         limit_request    = "8192"
@@ -659,7 +686,7 @@ We can use acme.sh with Cloudflare DNS API to issue Let's Encrypt certificates a
     domain = input("Enter your domain (e.g. example.com): ").strip()
     subdomain = input("Subdomain? (leave empty if root domain): ").strip()
 
-    state['api_token'] = api_token       # won't be saved to JSON
+    state['api_token'] = api_token  # not saved to JSON
     state['cloudflare_domain'] = domain
     state['cloudflare_subdomain'] = subdomain
 
@@ -838,10 +865,25 @@ We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and optionally 8069 for direc
     log("[OK] UFW firewall configured.")
 
 ########################################
-# Run Full Wizard
+# Full Wizard
 ########################################
 
 def run_full_wizard(state):
+    """
+    Runs all steps in recommended sequence:
+    1) Check/Upgrade Python
+    2) Install dependencies
+    3) Configure DB
+    4) Setup/Update Odoo code & environment
+    5) Prompt memory config
+    6) Configure Odoo
+    7) Create systemd service
+    8) Cloudflare domain SSL
+    9) Issue SSL with acme.sh
+    10) Nginx Reverse Proxy
+    11) SSH Hardening
+    12) Firewall
+    """
     log("Running full wizard.")
     check_python_version()
     prompt_install_dependencies()
@@ -918,7 +960,7 @@ def main_menu(state):
             print("[WARN] Invalid choice. Please select again.")
 
 def main():
-    print_ascii_banner()  # ASCII banner displayed at the start
+    print_ascii_banner()
     ensure_dir(os.path.dirname(LOG_FILE))
     check_root()
     detect_ubuntu()
