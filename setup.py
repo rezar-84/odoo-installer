@@ -4,6 +4,7 @@ import os
 import sys
 import subprocess
 import platform
+import re
 
 ########################################
 # HELPER FUNCTIONS
@@ -19,7 +20,8 @@ def print_ascii_banner():
    O D O O   W i z a r d
 
 ====================================
-Welcome to the Odoo Setup & Management Tool
+Welcome to the Odoo 18 Setup & Management Tool
+(Tested on Ubuntu 24.04 LTS)
 ====================================
 """
     print(banner)
@@ -34,7 +36,7 @@ def detect_ubuntu():
     """Check if the OS is Ubuntu."""
     os_info = platform.platform().lower()
     if "ubuntu" not in os_info:
-        print("\n[Warning] This script is designed for Ubuntu. Proceed with caution.")
+        print("\n[Warning] This script is designed for Ubuntu 24.04. Proceed with caution.")
     else:
         print("[OK] Ubuntu detected.")
 
@@ -76,7 +78,7 @@ def check_python_version():
         print("[Warning] python3 not found or version is unknown.")
 
     print("""
-We recommend Python 3.11 or 3.12 for Odoo.
+We recommend Python 3.11 or 3.12 for Odoo 18.
 1) Install/upgrade to Python 3.11
 2) Install/upgrade to Python 3.12
 3) Continue without upgrading (not recommended)
@@ -99,15 +101,16 @@ We recommend Python 3.11 or 3.12 for Odoo.
 
 def prompt_install_dependencies():
     """
-    Prompt user to install typical system dependencies for Odoo.
+    Prompt user to install typical system dependencies for Odoo 18
+    (matching guidelines e.g. from Cybrosys blog).
     """
     print("""
-We need the following dependencies for Odoo:
+We'll install required packages for Odoo 18 on Ubuntu 24.04:
 - git, curl, wget, nano, build-essential
 - PostgreSQL
 - libpq-dev, libxml2-dev, libxslt1-dev, zlib1g-dev, etc.
-- and possibly nginx for reverse proxy
-
+- nginx for reverse proxy
+- Additional dev headers for proper Odoo compilation
 Install dependencies now?
 1) Yes
 2) No
@@ -175,7 +178,6 @@ PostgreSQL Database Configuration
             run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
             print(f"[OK] Re-created user '{db_user}' with new password.")
         else:
-            # Update password if needed
             run_cmd(f"sudo -u postgres psql -c \"ALTER USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
             print(f"[OK] User '{db_user}' reused, password updated.")
     else:
@@ -213,23 +215,27 @@ def system_user_exists(user_name):
 
 def setup_odoo(state):
     """
-    Prompt for Odoo version, install path, system user, venv, and clone or reuse code.
+    Prompt for Odoo version, install path, system user, venv, clone or reuse code.
     """
     print("""
 Odoo Setup:
 -----------
 """)
-    odoo_ver = input(f"Which Odoo version? (default: {state.get('odoo_ver','18.0')}): ").strip()
+    # Default to 18.0
+    default_version = state.get('odoo_ver', '18.0')
+    odoo_ver = input(f"Which Odoo version? (default: {default_version}): ").strip()
     if not odoo_ver:
-        odoo_ver = state.get('odoo_ver', '18.0')
+        odoo_ver = default_version
 
-    install_path = input(f"Install directory? (default: {state.get('install_path','/opt/odoo18')}): ").strip()
+    default_path = state.get('install_path', '/opt/odoo18')
+    install_path = input(f"Install directory? (default: {default_path}): ").strip()
     if not install_path:
-        install_path = state.get('install_path', '/opt/odoo18')
+        install_path = default_path
 
-    odoo_user = input(f"System user for Odoo? (default: {state.get('odoo_user','odoo')}): ").strip()
+    default_user = state.get('odoo_user', 'odoo')
+    odoo_user = input(f"System user for Odoo? (default: {default_user}): ").strip()
     if not odoo_user:
-        odoo_user = state.get('odoo_user', 'odoo')
+        odoo_user = default_user
 
     print("""
 Do you want to use a Python virtual environment for Odoo?
@@ -294,6 +300,135 @@ Do you want to use a Python virtual environment for Odoo?
         run_cmd(f"pip install --upgrade pip && pip install -r {install_path}/requirements.txt")
         print("[OK] Odoo requirements installed system-wide.")
 
+########################################
+# MEMORY CONFIGURATION
+########################################
+
+def detect_system_memory_mb():
+    """
+    Read /proc/meminfo to get total system memory in MB.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            data = f.read()
+        match = re.search(r"^MemTotal:\s+(\d+)\skB", data, re.MULTILINE)
+        if match:
+            mem_kb = int(match.group(1))
+            return mem_kb // 1024
+    except:
+        pass
+    return 0
+
+def prompt_memory_config(state):
+    """
+    Ask for memory-based tuning:
+    - Number of Odoo workers
+    - Possibly tune PostgreSQL memory, if desired
+    """
+    print("""
+Memory Configuration
+--------------------
+We can help you choose an appropriate number of Odoo worker processes and optionally
+tweak PostgreSQL's memory parameters based on your server RAM.
+""")
+    sys_mem = detect_system_memory_mb()
+    if sys_mem > 0:
+        print(f"[INFO] Detected ~{sys_mem} MB system memory.")
+    else:
+        print("[WARNING] Could not detect system memory from /proc/meminfo.")
+
+    choice = input("Do you want to configure memory-based tuning now? (y/n): ").strip().lower()
+    if choice != 'y':
+        return
+
+    # Odoo workers
+    default_workers = 2
+    # A rough heuristic: for every 1GB, you can have ~1-2 workers. This is simplistic.
+    if sys_mem >= 2048 and sys_mem < 4096:
+        default_workers = 2
+    elif sys_mem >= 4096 and sys_mem < 8192:
+        default_workers = 4
+    elif sys_mem >= 8192 and sys_mem < 16384:
+        default_workers = 6
+    elif sys_mem >= 16384:
+        default_workers = 8
+
+    prompt_text = f"Number of Odoo worker processes? (default: {default_workers}): "
+    workers_in = input(prompt_text).strip()
+    if not workers_in:
+        workers_in = str(default_workers)
+    state['workers'] = workers_in
+
+    # PostgreSQL memory tweaks (shared_buffers, work_mem, etc.)
+    pg_tune_choice = input("\nTune PostgreSQL memory parameters? (y/n): ").strip().lower()
+    if pg_tune_choice == 'y':
+        # A basic approach: shared_buffers ~ 25% of system RAM (in MB)
+        # work_mem / maintenance_work_mem are smaller chunks
+        if sys_mem > 0:
+            sbuff = sys_mem // 4  # 25%
+            shared_buffers = f"{sbuff}MB"  # e.g. "1024MB"
+            work_mem = "16MB"
+            maintenance_work_mem = "64MB"
+
+            custom_sb = input(f"shared_buffers? (default: {shared_buffers}): ").strip()
+            if custom_sb:
+                shared_buffers = custom_sb
+
+            custom_wm = input(f"work_mem? (default: {work_mem}): ").strip()
+            if custom_wm:
+                work_mem = custom_wm
+
+            custom_mw = input(f"maintenance_work_mem? (default: {maintenance_work_mem}): ").strip()
+            if custom_mw:
+                maintenance_work_mem = custom_mw
+
+            # Write to postgresql.conf
+            run_cmd("systemctl stop postgresql")
+            # Typically at /etc/postgresql/14/main/postgresql.conf or /etc/postgresql/16/main
+            # We'll try version detection, but let's assume 16 for Ubuntu 24.04
+            pg_conf = "/etc/postgresql/16/main/postgresql.conf"
+            if not os.path.isfile(pg_conf):
+                pg_conf = "/etc/postgresql/14/main/postgresql.conf"
+
+            # We'll do naive string replace for demonstration
+            # A more robust approach might parse the file.
+            with open(pg_conf, 'r') as f:
+                lines = f.readlines()
+
+            new_lines = []
+            for line in lines:
+                if line.strip().startswith("shared_buffers"):
+                    new_lines.append(f"shared_buffers = {shared_buffers}\n")
+                elif line.strip().startswith("work_mem"):
+                    new_lines.append(f"work_mem = {work_mem}\n")
+                elif line.strip().startswith("maintenance_work_mem"):
+                    new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
+                else:
+                    new_lines.append(line)
+
+            # If not found, we can just append
+            if not any("shared_buffers" in l for l in new_lines):
+                new_lines.append(f"\nshared_buffers = {shared_buffers}\n")
+            if not any("work_mem" in l for l in new_lines):
+                new_lines.append(f"work_mem = {work_mem}\n")
+            if not any("maintenance_work_mem" in l for l in new_lines):
+                new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
+
+            with open(pg_conf, 'w') as f:
+                f.write("".join(new_lines))
+
+            run_cmd("systemctl start postgresql")
+            print("[OK] PostgreSQL memory parameters updated and service restarted.")
+        else:
+            print("[ERROR] Could not detect system memory. Skipping PG tuning.")
+
+    print("[OK] Memory configuration saved to script state.")
+    print("Remember to re-run 'Configure Odoo' if you want to update your Odoo config file with the new worker count.")
+
+########################################
+# CONFIGURE ODOO
+########################################
+
 def configure_odoo(state):
     """
     Prompt for Odoo config (master password, workers, etc.), then write to /etc/odoo.conf.
@@ -319,7 +454,6 @@ Odoo Configuration
         db_host = "localhost"
         db_port = "5432"
     else:
-        # Possibly user wants remote DB or skip
         db_host_input = input("DB Host? (default: False for local socket): ").strip()
         if db_host_input:
             db_host = db_host_input
@@ -332,14 +466,17 @@ Odoo Configuration
         if not db_pass:
             db_pass = "False"
 
-    workers = input("Number of worker processes? (default: 2): ").strip() or "2"
+    # If we have a memory-based workers setting in state, use that as a default
+    default_workers = state.get('workers', '2')
+    workers_in = input(f"Number of worker processes? (default: {default_workers}): ").strip()
+    if not workers_in:
+        workers_in = default_workers
 
     install_path = state.get('install_path', '/opt/odoo18')
 
-    # Write config
     conf_path = "/etc/odoo.conf"
     content = f"""[options]
-; Odoo Configuration File
+; Odoo 18 Configuration File
 admin_passwd = {admin_passwd}
 db_host = {db_host}
 db_port = {db_port}
@@ -347,29 +484,30 @@ db_user = {db_user}
 db_password = {db_pass}
 addons_path = {install_path}/addons
 logfile = /var/log/odoo/odoo.log
-workers = {workers}
+workers = {workers_in}
 """
 
     with open(conf_path, 'w') as f:
         f.write(content)
 
-    run_cmd(f"mkdir -p /var/log/odoo && chown -R {state.get('odoo_user','odoo')} /var/log/odoo")
+    odoo_user = state.get('odoo_user', 'odoo')
+    run_cmd(f"mkdir -p /var/log/odoo && chown -R {odoo_user} /var/log/odoo")
     run_cmd(f"chown root:root {conf_path} && chmod 640 {conf_path}")
 
     print(f"[OK] Wrote Odoo configuration to {conf_path}")
     # Save to state
     state['admin_passwd'] = admin_passwd
-    state['workers'] = workers
+    state['workers'] = workers_in
     state['odoo_conf_path'] = conf_path
     print("[INFO] Odoo configuration updated in script state.")
 
 ########################################
-# SERVICE
+# CREATE ODOO SERVICE
 ########################################
 
 def create_odoo_service(state):
     """
-    Create or overwrite systemd service for Odoo.
+    Create or overwrite systemd service for Odoo 18.
     """
     install_path = state.get('install_path', '/opt/odoo18')
     odoo_user = state.get('odoo_user', 'odoo')
@@ -380,7 +518,7 @@ def create_odoo_service(state):
         exec_path = f"{install_path}/venv/bin/python3 {install_path}/odoo-bin"
 
     service_content = f"""[Unit]
-Description=Odoo Service
+Description=Odoo 18 Service
 After=network.target postgresql.service
 
 [Service]
@@ -428,14 +566,14 @@ We can use acme.sh with Cloudflare DNS API to issue Let's Encrypt certificates a
         'domain': domain,
         'subdomain': subdomain
     }
-    print("[INFO] Cloudflare info stored. Use 'Issue/Install SSL' from the menu to proceed.")
+    print("[INFO] Cloudflare info stored. Use 'Issue/Install SSL Certificate' from the menu to proceed.")
 
 def setup_cloudflare_ssl(state):
     """
     Use acme.sh + DNS-01 challenge with CF token for SSL.
     """
     if 'cloudflare' not in state or not state['cloudflare'].get('api_token'):
-        print("[Error] Cloudflare not configured. Go to 'Configure Domain/Cloudflare' first.")
+        print("[Error] Cloudflare not configured. Go to 'Configure Domain / Cloudflare' first.")
         return
 
     api_token = state['cloudflare']['api_token']
@@ -485,12 +623,14 @@ Nginx Reverse Proxy Setup
         print("[INFO] Skipping Nginx configuration.")
         return
 
-    if 'cloudflare' not in state:
+    domain = ""
+    if 'cloudflare' in state:
+        domain_part = state['cloudflare']['domain']
+        subdomain_part = state['cloudflare']['subdomain']
+        domain = f"{subdomain_part}.{domain_part}" if subdomain_part else domain_part
+
+    if not domain:
         domain = input("Enter domain name (e.g. odoo.example.com): ").strip()
-    else:
-        domain = state['cloudflare']['domain']
-        subdomain = state['cloudflare']['subdomain']
-        domain = f"{subdomain}.{domain}" if subdomain else domain
 
     if not domain or domain == ".":
         print("[Error] Invalid domain.")
@@ -628,15 +768,17 @@ We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and 8069 for Odoo (optionally
 
 def run_full_wizard(state):
     """
-    Run all steps in sequence.
+    Run all steps in a sequence, following a standard approach
+    (similar to the Cybrosys blog instructions for Odoo 18).
     """
     check_python_version()
     prompt_install_dependencies()
     configure_database(state)
     setup_odoo(state)
+    prompt_memory_config(state)   # memory-based tuning
     configure_odoo(state)
     create_odoo_service(state)
-    prompt_cloudflare(state)  # Just collects info
+    prompt_cloudflare(state)  # collect info
     setup_cloudflare_ssl(state)
     configure_nginx(state)
     harden_ssh()
@@ -660,14 +802,15 @@ def main_menu(state):
 1) Run Complete Setup Wizard
 2) Database Setup/Update
 3) Odoo Setup/Update
-4) Configure Odoo (Config File)
-5) Create/Update Odoo Service
-6) Configure Domain / Cloudflare
-7) Issue/Install SSL Certificate
-8) Configure Nginx Reverse Proxy
-9) SSH Hardening
-10) Configure Firewall
-11) Exit
+4) Memory Config & Tuning
+5) Configure Odoo (Config File)
+6) Create/Update Odoo Service
+7) Configure Domain / Cloudflare
+8) Issue/Install SSL Certificate
+9) Configure Nginx Reverse Proxy
+10) SSH Hardening
+11) Configure Firewall
+12) Exit
 """)
         choice = input("Select an option: ").strip()
         if choice == "1":
@@ -677,20 +820,22 @@ def main_menu(state):
         elif choice == "3":
             setup_odoo(state)
         elif choice == "4":
-            configure_odoo(state)
+            prompt_memory_config(state)
         elif choice == "5":
-            create_odoo_service(state)
+            configure_odoo(state)
         elif choice == "6":
-            prompt_cloudflare(state)
+            create_odoo_service(state)
         elif choice == "7":
-            setup_cloudflare_ssl(state)
+            prompt_cloudflare(state)
         elif choice == "8":
-            configure_nginx(state)
+            setup_cloudflare_ssl(state)
         elif choice == "9":
-            harden_ssh()
+            configure_nginx(state)
         elif choice == "10":
-            configure_firewall()
+            harden_ssh()
         elif choice == "11":
+            configure_firewall()
+        elif choice == "12":
             print("[INFO] Exiting.")
             break
         else:
@@ -701,11 +846,11 @@ def main():
     check_root()
     detect_ubuntu()
 
-    # We store dynamic states here, e.g. db info, domain, etc.
+    # We store dynamic states here, e.g. db info, domain, memory settings, etc.
     state = {}
 
     main_menu(state)
-    print("\n[Done] Thanks for using the Odoo Setup & Management Tool!\n")
+    print("\n[Done] Thanks for using the Odoo 18 Setup & Management Tool!\n")
 
 if __name__ == "__main__":
     main()
