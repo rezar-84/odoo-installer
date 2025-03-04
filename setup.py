@@ -5,6 +5,10 @@ import sys
 import subprocess
 import platform
 
+########################################
+# HELPER FUNCTIONS
+########################################
+
 def print_ascii_banner():
     banner = r"""
    ____  ____          __
@@ -15,7 +19,7 @@ def print_ascii_banner():
    O D O O   W i z a r d
 
 ====================================
-Welcome to the Odoo Installation Wizard
+Welcome to the Odoo Setup & Management Tool
 ====================================
 """
     print(banner)
@@ -44,16 +48,18 @@ def run_cmd(cmd, capture_output=False):
     else:
         subprocess.run(cmd, shell=True, check=False)
 
+########################################
+# PYTHON CHECK/INSTALL
+########################################
+
 def check_python_version():
     """
     Check if Python >= 3.11 is installed.
     Ask user if they want to install/upgrade to 3.11 or 3.12.
     """
-    # Quick check for python3 version
     print("\n[Step] Checking Python version...")
     version_output, _ = run_cmd("python3 --version", capture_output=True)
     if version_output:
-        # Expect something like "Python 3.11.2"
         parts = version_output.strip().split()
         if len(parts) == 2 and parts[0].lower() == "python":
             major, minor, *_ = parts[1].split(".")
@@ -69,7 +75,6 @@ def check_python_version():
     else:
         print("[Warning] python3 not found or version is unknown.")
 
-    # Prompt to install or upgrade
     print("""
 We recommend Python 3.11 or 3.12 for Odoo.
 1) Install/upgrade to Python 3.11
@@ -81,8 +86,6 @@ We recommend Python 3.11 or 3.12 for Odoo.
         run_cmd("apt update && apt install -y python3.11 python3.11-venv python3.11-dev")
         run_cmd("update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1")
     elif choice == "2":
-        # Python 3.12 might not yet be in official Ubuntu repos (depending on Ubuntu version),
-        # but let's assume the user has a repo or uses deadsnakes PPA for demonstration:
         run_cmd("apt update && apt install -y software-properties-common")
         run_cmd("add-apt-repository ppa:deadsnakes/ppa -y")
         run_cmd("apt update && apt install -y python3.12 python3.12-venv python3.12-dev")
@@ -90,9 +93,13 @@ We recommend Python 3.11 or 3.12 for Odoo.
     else:
         print("[INFO] Continuing without upgrading Python...")
 
+########################################
+# INSTALL DEPENDENCIES
+########################################
+
 def prompt_install_dependencies():
     """
-    Prompt user to install typical system dependencies for Odoo and build.
+    Prompt user to install typical system dependencies for Odoo.
     """
     print("""
 We need the following dependencies for Odoo:
@@ -115,50 +122,114 @@ Install dependencies now?
         run_cmd("apt update")
         run_cmd(f"apt install -y {' '.join(deps)}")
 
-def prompt_db_setup():
+########################################
+# DATABASE SETUP / CHECK
+########################################
+
+def db_exists(db_name):
+    cmd = f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='{db_name}';\""
+    out, _ = run_cmd(cmd, capture_output=True)
+    return out.strip() == "1"
+
+def db_user_exists(db_user):
+    cmd = f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{db_user}';\""
+    out, _ = run_cmd(cmd, capture_output=True)
+    return out.strip() == "1"
+
+def configure_database(state):
     """
-    Prompt user for DB setup.
+    Configure or update database info.  
+    Stores db_name, db_user, db_pass into the state dict.
     """
     print("""
-Do you want to configure PostgreSQL now?
-1) Yes - create DB user & database
-2) No  - skip
+PostgreSQL Database Configuration
+---------------------------------
+1) Create/Reuse DB & User
+2) Return to Main Menu
 """)
     choice = input("Choose an option (1/2): ").strip()
-    if choice == "1":
-        db_name = input("Enter DB name (e.g., odoo18db): ").strip()
-        db_user = input("Enter DB user (e.g., odoo): ").strip()
-        db_pass = input("Enter DB password: ").strip()
-        # Create user & DB
-        # Check if postgres is running
-        run_cmd("systemctl enable postgresql && systemctl start postgresql")
-        run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
-        run_cmd(f"sudo -u postgres psql -c \"CREATE DATABASE {db_name} OWNER {db_user};\"")
-        print(f"[OK] Database {db_name} with user {db_user} created.")
-        return db_name, db_user, db_pass
-    else:
-        print("[INFO] Skipped DB setup.")
-        return None, None, None
+    if choice != "1":
+        return
 
-def prompt_odoo_setup():
+    db_name = input("Enter DB name (default: odoo18db): ").strip()
+    if not db_name:
+        db_name = "odoo18db"
+
+    db_user = input("Enter DB user (default: odoo): ").strip()
+    if not db_user:
+        db_user = "odoo"
+
+    db_pass = input("Enter DB password (default: odoo): ").strip()
+    if not db_pass:
+        db_pass = "odoo"
+
+    # Ensure Postgres is running
+    run_cmd("systemctl enable postgresql && systemctl start postgresql")
+
+    # Check if user already exists
+    if db_user_exists(db_user):
+        print(f"[INFO] DB user '{db_user}' already exists.")
+        reuse_user_choice = input("Do you want to reuse this user? (y/n): ").strip().lower()
+        if reuse_user_choice == "n":
+            run_cmd(f"sudo -u postgres psql -c \"DROP ROLE {db_user};\"")
+            run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
+            print(f"[OK] Re-created user '{db_user}' with new password.")
+        else:
+            # Update password if needed
+            run_cmd(f"sudo -u postgres psql -c \"ALTER USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
+            print(f"[OK] User '{db_user}' reused, password updated.")
+    else:
+        run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
+        print(f"[OK] User '{db_user}' created.")
+
+    # Check if DB already exists
+    if db_exists(db_name):
+        print(f"[INFO] Database '{db_name}' already exists.")
+        reuse_db_choice = input("Do you want to reuse this database? (y/n): ").strip().lower()
+        if reuse_db_choice == "n":
+            run_cmd(f"sudo -u postgres psql -c \"DROP DATABASE {db_name};\"")
+            run_cmd(f"sudo -u postgres psql -c \"CREATE DATABASE {db_name} OWNER {db_user};\"")
+            print(f"[OK] Re-created database '{db_name}'.")
+        else:
+            print(f"[OK] Database '{db_name}' reused.")
+    else:
+        run_cmd(f"sudo -u postgres psql -c \"CREATE DATABASE {db_name} OWNER {db_user};\"")
+        print(f"[OK] Database '{db_name}' created, owned by '{db_user}'.")
+
+    # Store in state
+    state['db_name'] = db_name
+    state['db_user'] = db_user
+    state['db_pass'] = db_pass
+    print("[INFO] Database info updated in script state.")
+
+########################################
+# SYSTEM USER, ODOO SETUP
+########################################
+
+def system_user_exists(user_name):
+    cmd = f"id -u {user_name}"
+    proc = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return proc.returncode == 0
+
+def setup_odoo(state):
     """
-    Prompt user for Odoo version, install path, system user, etc.
+    Prompt for Odoo version, install path, system user, venv, and clone or reuse code.
     """
     print("""
 Odoo Setup:
 -----------
 """)
-    odoo_ver = input("Which Odoo version do you want to install? (default 18.0): ").strip()
+    odoo_ver = input(f"Which Odoo version? (default: {state.get('odoo_ver','18.0')}): ").strip()
     if not odoo_ver:
-        odoo_ver = "18.0"
+        odoo_ver = state.get('odoo_ver', '18.0')
 
-    install_path = input("Enter install directory (default: /opt/odoo18): ").strip()
+    install_path = input(f"Install directory? (default: {state.get('install_path','/opt/odoo18')}): ").strip()
     if not install_path:
-        install_path = "/opt/odoo18"
+        install_path = state.get('install_path', '/opt/odoo18')
 
-    odoo_user = input("System user for Odoo (default: odoo): ").strip()
+    odoo_user = input(f"System user for Odoo? (default: {state.get('odoo_user','odoo')}): ").strip()
     if not odoo_user:
-        odoo_user = "odoo"
+        odoo_user = state.get('odoo_user', 'odoo')
 
     print("""
 Do you want to use a Python virtual environment for Odoo?
@@ -168,34 +239,64 @@ Do you want to use a Python virtual environment for Odoo?
     venv_choice = input("Choose (1/2): ").strip()
     use_venv = (venv_choice == "1")
 
-    return (odoo_ver, install_path, odoo_user, use_venv)
+    # Save to state
+    state['odoo_ver'] = odoo_ver
+    state['install_path'] = install_path
+    state['odoo_user'] = odoo_user
+    state['use_venv'] = use_venv
 
-def setup_odoo(odoo_ver, install_path, odoo_user, use_venv):
-    """
-    Executes commands to:
-    - Create Odoo user
-    - Clone Odoo from GitHub
-    - Setup venv if chosen
-    - Install requirements
-    """
-    # Create system user
-    run_cmd(f"id -u {odoo_user} || useradd -m -d {install_path} -U -r -s /bin/bash {odoo_user}")
-
-    # Clone Odoo
-    run_cmd(f"git clone --depth 1 --branch {odoo_ver} https://github.com/odoo/odoo.git {install_path}")
-
-    # Setup venv
-    if use_venv:
-        run_cmd(f"python3 -m venv {install_path}/venv")
-        run_cmd(f"source {install_path}/venv/bin/activate && pip install -r {install_path}/requirements.txt && deactivate")
+    # Create or reuse system user
+    if system_user_exists(odoo_user):
+        print(f"[INFO] System user '{odoo_user}' already exists.")
+        reuse_user_choice = input("Do you want to reuse this user? (y/n): ").strip().lower()
+        if reuse_user_choice == 'n':
+            run_cmd(f"userdel -r {odoo_user}")
+            run_cmd(f"useradd -m -d {install_path} -U -r -s /bin/bash {odoo_user}")
+            print(f"[OK] Re-created system user '{odoo_user}'.")
+        else:
+            print(f"[OK] Reusing existing user '{odoo_user}'.")
     else:
-        # system-wide
-        run_cmd(f"pip install -r {install_path}/requirements.txt")
+        run_cmd(f"useradd -m -d {install_path} -U -r -s /bin/bash {odoo_user}")
+        print(f"[OK] Created system user '{odoo_user}'.")
 
-def prompt_odoo_config(db_name=None, db_user=None, db_pass=None):
+    # Clone or reuse Odoo code
+    if os.path.isdir(install_path) and os.path.isdir(os.path.join(install_path, ".git")):
+        print(f"[INFO] Found existing Odoo installation at {install_path}.")
+        reuse_odoo_choice = input("Do you want to reuse this Odoo directory? (y/n): ").strip().lower()
+        if reuse_odoo_choice == 'n':
+            run_cmd(f"rm -rf {install_path}")
+            run_cmd(f"git clone --depth 1 --branch {odoo_ver} https://github.com/odoo/odoo.git {install_path}")
+            print(f"[OK] Downloaded fresh Odoo {odoo_ver} to {install_path}")
+        else:
+            print("[OK] Reusing existing Odoo directory.")
+    else:
+        run_cmd(f"git clone --depth 1 --branch {odoo_ver} https://github.com/odoo/odoo.git {install_path}")
+        print(f"[OK] Downloaded Odoo {odoo_ver} to {install_path}")
+
+    # Adjust ownership
+    run_cmd(f"chown -R {odoo_user}:{odoo_user} {install_path}")
+
+    # Set up venv or system-wide
+    if use_venv:
+        venv_path = os.path.join(install_path, "venv")
+        if os.path.isdir(venv_path):
+            print("[INFO] Virtual environment already exists.")
+            reuse_venv_choice = input("Reuse existing venv? (y/n): ").strip().lower()
+            if reuse_venv_choice == 'n':
+                run_cmd(f"rm -rf {venv_path}")
+                run_cmd(f"python3 -m venv {venv_path}")
+        else:
+            run_cmd(f"python3 -m venv {venv_path}")
+
+        run_cmd(f"source {venv_path}/bin/activate && pip install --upgrade pip && pip install -r {install_path}/requirements.txt && deactivate")
+        print("[OK] Odoo requirements installed in venv.")
+    else:
+        run_cmd(f"pip install --upgrade pip && pip install -r {install_path}/requirements.txt")
+        print("[OK] Odoo requirements installed system-wide.")
+
+def configure_odoo(state):
     """
-    Prompt for Odoo configuration (admin_passwd, etc.)
-    Return a dict of config values for writing to config file.
+    Prompt for Odoo config (master password, workers, etc.), then write to /etc/odoo.conf.
     """
     print("""
 Odoo Configuration
@@ -205,67 +306,77 @@ Odoo Configuration
     if not admin_passwd:
         admin_passwd = "admin"
 
-    # If user didn't set up DB above, db_name/user/pass might be None
-    # We’ll let Odoo handle it if not specified
+    db_host = "False"
+    db_port = "False"
+
+    # If user previously configured DB in state
+    db_name = state.get('db_name')
+    db_user = state.get('db_user')
+    db_pass = state.get('db_pass')
+
     if db_name:
+        # We'll assume local
         db_host = "localhost"
         db_port = "5432"
     else:
         # Possibly user wants remote DB or skip
-        db_host = input("DB Host? (default: False for local socket): ").strip()
-        if not db_host:
-            db_host = "False"
-        db_port = input("DB Port? (default: False): ").strip()
-        if not db_port:
-            db_port = "False"
-        db_user = db_user if db_user else "odoo"
-        db_pass = db_pass if db_pass else "False"
+        db_host_input = input("DB Host? (default: False for local socket): ").strip()
+        if db_host_input:
+            db_host = db_host_input
+        db_port_input = input("DB Port? (default: False): ").strip()
+        if db_port_input:
+            db_port = db_port_input
+
+        if not db_user:
+            db_user = "odoo"
+        if not db_pass:
+            db_pass = "False"
 
     workers = input("Number of worker processes? (default: 2): ").strip() or "2"
 
-    return {
-        "admin_passwd": admin_passwd,
-        "db_host": db_host,
-        "db_port": db_port,
-        "db_user": db_user,
-        "db_password": db_pass,
-        "workers": workers
-    }
+    install_path = state.get('install_path', '/opt/odoo18')
 
-def write_odoo_config(config_dict, install_path):
-    """
-    Write /etc/odoo<version>.conf or something similar
-    """
-    conf_path = f"/etc/odoo.conf"
+    # Write config
+    conf_path = "/etc/odoo.conf"
     content = f"""[options]
 ; Odoo Configuration File
-admin_passwd = {config_dict['admin_passwd']}
-db_host = {config_dict['db_host']}
-db_port = {config_dict['db_port']}
-db_user = {config_dict['db_user']}
-db_password = {config_dict['db_password']}
+admin_passwd = {admin_passwd}
+db_host = {db_host}
+db_port = {db_port}
+db_user = {db_user}
+db_password = {db_pass}
 addons_path = {install_path}/addons
 logfile = /var/log/odoo/odoo.log
-workers = {config_dict['workers']}
+workers = {workers}
 """
 
     with open(conf_path, 'w') as f:
         f.write(content)
 
-    print(f"[OK] Wrote Odoo configuration to {conf_path}")
-    run_cmd(f"mkdir -p /var/log/odoo && chown -R {install_path.split('/')[-1]}: /var/log/odoo")
+    run_cmd(f"mkdir -p /var/log/odoo && chown -R {state.get('odoo_user','odoo')} /var/log/odoo")
     run_cmd(f"chown root:root {conf_path} && chmod 640 {conf_path}")
 
-    return conf_path
+    print(f"[OK] Wrote Odoo configuration to {conf_path}")
+    # Save to state
+    state['admin_passwd'] = admin_passwd
+    state['workers'] = workers
+    state['odoo_conf_path'] = conf_path
+    print("[INFO] Odoo configuration updated in script state.")
 
-def create_odoo_service(install_path, odoo_user):
+########################################
+# SERVICE
+########################################
+
+def create_odoo_service(state):
     """
-    Create and enable a systemd service.
+    Create or overwrite systemd service for Odoo.
     """
+    install_path = state.get('install_path', '/opt/odoo18')
+    odoo_user = state.get('odoo_user', 'odoo')
     service_file = "/etc/systemd/system/odoo.service"
+
     exec_path = f"{install_path}/odoo-bin"
-    # Check if venv
-    if os.path.exists(os.path.join(install_path, "venv")):
+    if state.get('use_venv'):
         exec_path = f"{install_path}/venv/bin/python3 {install_path}/odoo-bin"
 
     service_content = f"""[Unit]
@@ -287,12 +398,16 @@ WantedBy=multi-user.target
 
     run_cmd("systemctl daemon-reload")
     run_cmd("systemctl enable --now odoo.service")
-    print("[OK] Odoo service started.")
+    print("[OK] Odoo service started or restarted.")
+    state['service_file'] = service_file
 
-def prompt_cloudflare():
+########################################
+# CLOUDFLARE / ACME
+########################################
+
+def prompt_cloudflare(state):
     """
-    Prompt user for Cloudflare integration details.
-    We'll attempt to set up acme.sh with DNS-01 challenge.
+    Prompt user for Cloudflare integration details, store in state.
     """
     print("""
 Cloudflare Integration
@@ -301,59 +416,91 @@ We can use acme.sh with Cloudflare DNS API to issue Let's Encrypt certificates a
 """)
     choice = input("Do you want to configure Cloudflare SSL? (y/n): ").strip().lower()
     if choice != 'y':
-        return None, None, None
+        print("[INFO] Skipping Cloudflare integration.")
+        return
 
     api_token = input("Enter your Cloudflare API Token: ").strip()
     domain = input("Enter your domain (e.g. example.com): ").strip()
-
-    # Possibly subdomain
     subdomain = input("Subdomain? (leave empty if root domain): ").strip()
 
-    return api_token, domain, subdomain
+    state['cloudflare'] = {
+        'api_token': api_token,
+        'domain': domain,
+        'subdomain': subdomain
+    }
+    print("[INFO] Cloudflare info stored. Use 'Issue/Install SSL' from the menu to proceed.")
 
-def setup_cloudflare_ssl(api_token, domain, subdomain):
+def setup_cloudflare_ssl(state):
     """
     Use acme.sh + DNS-01 challenge with CF token for SSL.
-    We'll set environment variables for acme.sh, or write them to a file.
     """
+    if 'cloudflare' not in state or not state['cloudflare'].get('api_token'):
+        print("[Error] Cloudflare not configured. Go to 'Configure Domain/Cloudflare' first.")
+        return
+
+    api_token = state['cloudflare']['api_token']
+    domain = state['cloudflare']['domain']
+    subdomain = state['cloudflare']['subdomain']
+    if not domain:
+        print("[Error] Domain is missing. Please re-enter Cloudflare info.")
+        return
+
     # Install acme.sh if not present
-    print("\n[INFO] Installing acme.sh (if not already installed)...")
-    run_cmd("apt install -y socat")  # often needed by acme.sh
+    print("\n[INFO] Installing acme.sh (if not installed)...")
+    run_cmd("apt install -y socat")
     run_cmd("curl https://get.acme.sh | sh -s email=my@example.com")
 
-    # Environment variables for Cloudflare
-    # acme.sh can use CF_Token and CF_Account_ID, but let's keep it simple.
     os.environ["CF_Token"] = api_token
 
     full_domain = f"{subdomain}.{domain}" if subdomain else domain
-    print(f"\n[INFO] Issuing certificate for {full_domain} via acme.sh using DNS-01 challenge...")
+    print(f"[INFO] Issuing certificate for {full_domain} via acme.sh (DNS-01 challenge)...")
 
     acme_cmd = f"~/.acme.sh/acme.sh --issue --dns dns_cf -d {full_domain}"
     run_cmd(acme_cmd)
 
     # Install the certificate to /etc/letsencrypt/odoo:
-    install_cmd = f"~/.acme.sh/acme.sh --install-cert -d {full_domain} " \
-                  f"--key-file /etc/letsencrypt/odoo.key " \
-                  f"--fullchain-file /etc/letsencrypt/odoo.crt " \
-                  f"--reloadcmd \"systemctl reload nginx\""
     run_cmd("mkdir -p /etc/letsencrypt/")
+    install_cmd = (f"~/.acme.sh/acme.sh --install-cert -d {full_domain} "
+                   f"--key-file /etc/letsencrypt/odoo.key "
+                   f"--fullchain-file /etc/letsencrypt/odoo.crt "
+                   f"--reloadcmd \"systemctl reload nginx\"")
     run_cmd(install_cmd)
 
     print(f"[OK] SSL certificate installed for {full_domain} in /etc/letsencrypt.")
 
-def prompt_nginx_config(full_domain):
+########################################
+# NGINX CONFIG
+########################################
+
+def configure_nginx(state):
     """
-    Prompt to configure Nginx as a reverse proxy for Odoo.
+    Configure or update an Nginx reverse proxy for Odoo with SSL.
     """
-    choice = input("Do you want to configure Nginx reverse proxy for Odoo? (y/n): ").strip().lower()
+    print("""
+Nginx Reverse Proxy Setup
+-------------------------
+""")
+    choice = input("Do you want to configure Nginx now? (y/n): ").strip().lower()
     if choice != 'y':
+        print("[INFO] Skipping Nginx configuration.")
         return
-    # We'll assume the user wants to serve Odoo on 80/443
+
+    if 'cloudflare' not in state:
+        domain = input("Enter domain name (e.g. odoo.example.com): ").strip()
+    else:
+        domain = state['cloudflare']['domain']
+        subdomain = state['cloudflare']['subdomain']
+        domain = f"{subdomain}.{domain}" if subdomain else domain
+
+    if not domain or domain == ".":
+        print("[Error] Invalid domain.")
+        return
+
     config_path = "/etc/nginx/sites-available/odoo"
     conf_content = f"""
 server {{
     listen 80;
-    server_name {full_domain};
+    server_name {domain};
 
     # Redirect to HTTPS
     return 301 https://$host$request_uri;
@@ -361,7 +508,7 @@ server {{
 
 server {{
     listen 443 ssl;
-    server_name {full_domain};
+    server_name {domain};
 
     ssl_certificate /etc/letsencrypt/odoo.crt;
     ssl_certificate_key /etc/letsencrypt/odoo.key;
@@ -391,24 +538,28 @@ server {{
     with open(config_path, 'w') as f:
         f.write(conf_content)
 
-    run_cmd(f"ln -s {config_path} /etc/nginx/sites-enabled/odoo")
+    run_cmd(f"ln -sf {config_path} /etc/nginx/sites-enabled/odoo")
     run_cmd("systemctl restart nginx")
-    print(f"[OK] Nginx reverse proxy configured for {full_domain}.")
+    print(f"[OK] Nginx reverse proxy configured for {domain}.")
 
-def prompt_ssh_hardening():
-    """
-    Prompt user if they want to harden SSH (add key, disable password).
-    """
-    choice = input("\nDo you want to harden SSH? (y/n): ").strip().lower()
+########################################
+# SSH HARDENING
+########################################
+
+def harden_ssh():
+    print("""
+SSH Hardening
+-------------
+""")
+    choice = input("Do you want to harden SSH? (y/n): ").strip().lower()
     if choice != 'y':
         return
-    # Ask for public key
+
     pub_key = input("Paste your public SSH key (e.g. ssh-rsa AAAAB3...):\n").strip()
     if not pub_key.startswith("ssh-"):
         print("[Warning] That doesn't look like a valid SSH key. Skipping.")
         return
 
-    # Add the key to root or the current user
     ssh_user = input("Which user do you want to add the key for? (default: root): ").strip()
     if not ssh_user:
         ssh_user = "root"
@@ -417,8 +568,10 @@ def prompt_ssh_hardening():
     ssh_dir = os.path.join(user_home, ".ssh")
     run_cmd(f"mkdir -p {ssh_dir}")
     auth_keys_path = os.path.join(ssh_dir, "authorized_keys")
+
     with open(auth_keys_path, 'a') as f:
         f.write(pub_key + "\n")
+
     run_cmd(f"chown -R {ssh_user}:{ssh_user} {ssh_dir}")
     run_cmd(f"chmod 700 {ssh_dir}")
     run_cmd(f"chmod 600 {auth_keys_path}")
@@ -439,47 +592,121 @@ def prompt_ssh_hardening():
         run_cmd("systemctl restart sshd")
         print("[OK] Password login disabled. Make sure your SSH key works!")
 
-def main():
-    print_ascii_banner()
-    check_root()
-    detect_ubuntu()
+########################################
+# FIREWALL (UFW) SETUP
+########################################
 
-    # Step 1: Check / upgrade python
+def configure_firewall():
+    print("""
+UFW Firewall Configuration
+--------------------------
+We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and 8069 for Odoo (optionally).
+""")
+    choice = input("Do you want to install and configure UFW? (y/n): ").strip().lower()
+    if choice != 'y':
+        return
+
+    run_cmd("apt install -y ufw")
+
+    # Basic rules
+    run_cmd("ufw allow 22")
+    run_cmd("ufw allow 80")
+    run_cmd("ufw allow 443")
+
+    # Option to open Odoo port directly
+    odoo_port_choice = input("Open Odoo port 8069? (y/n): ").strip().lower()
+    if odoo_port_choice == 'y':
+        run_cmd("ufw allow 8069")
+
+    run_cmd("ufw enable")
+    run_cmd("ufw status")
+    print("[OK] UFW firewall configured.")
+
+########################################
+# FULL WIZARD
+########################################
+
+def run_full_wizard(state):
+    """
+    Run all steps in sequence.
+    """
     check_python_version()
-
-    # Step 2: Prompt for system dependencies
     prompt_install_dependencies()
-
-    # Step 3: DB Setup
-    db_name, db_user, db_pass = prompt_db_setup()
-
-    # Step 4: Odoo Setup
-    odoo_ver, install_path, odoo_user, use_venv = prompt_odoo_setup()
-    setup_odoo(odoo_ver, install_path, odoo_user, use_venv)
-
-    # Step 5: Odoo Config
-    config_vals = prompt_odoo_config(db_name, db_user, db_pass)
-    conf_path = write_odoo_config(config_vals, install_path)
-
-    # Step 6: Create systemd service
-    create_odoo_service(install_path, odoo_user)
-
-    # Step 7: Cloudflare / acme.sh SSL
-    api_token, domain, subdomain = prompt_cloudflare()
-    if api_token and domain:
-        setup_cloudflare_ssl(api_token, domain, subdomain)
-        full_domain = f"{subdomain}.{domain}" if subdomain else domain
-        # Step 8: Nginx reverse proxy
-        prompt_nginx_config(full_domain)
-
-    # Step 9: SSH Hardening
-    prompt_ssh_hardening()
-
+    configure_database(state)
+    setup_odoo(state)
+    configure_odoo(state)
+    create_odoo_service(state)
+    prompt_cloudflare(state)  # Just collects info
+    setup_cloudflare_ssl(state)
+    configure_nginx(state)
+    harden_ssh()
+    configure_firewall()
     print("\n[Installation Complete]")
     print("=========================================")
     print("Odoo should now be running on port 8069. If you configured")
     print("Nginx and SSL, then your domain should serve Odoo over HTTPS.")
     print("=========================================")
 
+########################################
+# MAIN MENU
+########################################
+
+def main_menu(state):
+    while True:
+        print("""
+=================================
+ Main Menu
+=================================
+1) Run Complete Setup Wizard
+2) Database Setup/Update
+3) Odoo Setup/Update
+4) Configure Odoo (Config File)
+5) Create/Update Odoo Service
+6) Configure Domain / Cloudflare
+7) Issue/Install SSL Certificate
+8) Configure Nginx Reverse Proxy
+9) SSH Hardening
+10) Configure Firewall
+11) Exit
+""")
+        choice = input("Select an option: ").strip()
+        if choice == "1":
+            run_full_wizard(state)
+        elif choice == "2":
+            configure_database(state)
+        elif choice == "3":
+            setup_odoo(state)
+        elif choice == "4":
+            configure_odoo(state)
+        elif choice == "5":
+            create_odoo_service(state)
+        elif choice == "6":
+            prompt_cloudflare(state)
+        elif choice == "7":
+            setup_cloudflare_ssl(state)
+        elif choice == "8":
+            configure_nginx(state)
+        elif choice == "9":
+            harden_ssh()
+        elif choice == "10":
+            configure_firewall()
+        elif choice == "11":
+            print("[INFO] Exiting.")
+            break
+        else:
+            print("[Warning] Invalid choice. Please select again.")
+
+def main():
+    print_ascii_banner()
+    check_root()
+    detect_ubuntu()
+
+    # We store dynamic states here, e.g. db info, domain, etc.
+    state = {}
+
+    main_menu(state)
+    print("\n[Done] Thanks for using the Odoo Setup & Management Tool!\n")
+
 if __name__ == "__main__":
     main()
+
