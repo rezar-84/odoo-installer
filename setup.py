@@ -20,8 +20,7 @@ def print_ascii_banner():
    O D O O   W i z a r d
 
 ====================================
-Welcome to the Odoo 18 Setup & Management Tool
-(Tested on Ubuntu 24.04 LTS)
+Welcome to the Odoo 18 Installer for Ubuntu 24.04
 ====================================
 """
     print(banner)
@@ -33,7 +32,7 @@ def check_root():
         sys.exit(1)
 
 def detect_ubuntu():
-    """Check if the OS is Ubuntu."""
+    """Check if the OS is Ubuntu 24.04."""
     os_info = platform.platform().lower()
     if "ubuntu" not in os_info:
         print("\n[Warning] This script is designed for Ubuntu 24.04. Proceed with caution.")
@@ -41,7 +40,7 @@ def detect_ubuntu():
         print("[OK] Ubuntu detected.")
 
 def run_cmd(cmd, capture_output=False):
-    """Helper to run shell commands."""
+    """Helper to run shell commands, printing them first."""
     print(f"\n[CMD] {cmd}")
     if capture_output:
         result = subprocess.run(cmd, shell=True, check=False,
@@ -96,34 +95,50 @@ We recommend Python 3.11 or 3.12 for Odoo 18.
         print("[INFO] Continuing without upgrading Python...")
 
 ########################################
-# INSTALL DEPENDENCIES
+# INSTALL CORE DEPENDENCIES
 ########################################
 
 def prompt_install_dependencies():
     """
-    Prompt user to install typical system dependencies for Odoo 18
-    (matching guidelines e.g. from Cybrosys blog).
+    Prompt user to install typical system dependencies for Odoo 18,
+    including Node.js, yarn, wkhtmltopdf, etc.
     """
     print("""
-We'll install required packages for Odoo 18 on Ubuntu 24.04:
+We'll install required packages for Odoo 18 on Ubuntu 24.04, including:
 - git, curl, wget, nano, build-essential
-- PostgreSQL
-- libpq-dev, libxml2-dev, libxslt1-dev, zlib1g-dev, etc.
+- PostgreSQL and dev libs
+- libpq-dev, libxml2-dev, libxslt1-dev, zlib1g-dev, libjpeg-dev
 - nginx for reverse proxy
-- Additional dev headers for proper Odoo compilation
+- nodejs, npm, yarn (for Odoo assets)
+- wkhtmltopdf (for printing PDFs)
 Install dependencies now?
 1) Yes
 2) No
 """)
     choice = input("Choose an option (1/2): ").strip()
     if choice == "1":
-        deps = [
+        # Basic system deps
+        base_deps = [
             "git", "curl", "wget", "nano", "build-essential", "python3-pip",
             "libpq-dev", "libxml2-dev", "libxslt1-dev", "zlib1g-dev", "libjpeg-dev",
-            "postgresql", "postgresql-contrib", "nginx"
+            "postgresql", "postgresql-contrib", "nginx", "xfonts-75dpi", "xfonts-base"
         ]
         run_cmd("apt update")
-        run_cmd(f"apt install -y {' '.join(deps)}")
+        run_cmd(f"apt install -y {' '.join(base_deps)}")
+
+        # Node.js, Yarn, wkhtmltopdf
+        print("[INFO] Installing Node.js, npm, yarn, wkhtmltopdf...")
+        # For Node 16/18/20, you might prefer official NodeSource, e.g.:
+        run_cmd("curl -sL https://deb.nodesource.com/setup_18.x | bash -")
+        run_cmd("apt install -y nodejs npm")
+
+        # Yarn
+        run_cmd("npm install -g yarn")
+
+        # Wkhtmltopdf (the older 0.12.5 is usually recommended, but let's do standard apt for now)
+        run_cmd("apt install -y wkhtmltopdf")
+
+        print("[OK] Dependencies installed.")
 
 ########################################
 # DATABASE SETUP / CHECK
@@ -173,7 +188,7 @@ PostgreSQL Database Configuration
     if db_user_exists(db_user):
         print(f"[INFO] DB user '{db_user}' already exists.")
         reuse_user_choice = input("Do you want to reuse this user? (y/n): ").strip().lower()
-        if reuse_user_choice == "n":
+        if reuse_user_choice == 'n':
             run_cmd(f"sudo -u postgres psql -c \"DROP ROLE {db_user};\"")
             run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
             print(f"[OK] Re-created user '{db_user}' with new password.")
@@ -216,6 +231,7 @@ def system_user_exists(user_name):
 def setup_odoo(state):
     """
     Prompt for Odoo version, install path, system user, venv, clone or reuse code.
+    Actually clones Odoo from github and installs requirements.
     """
     print("""
 Odoo Setup:
@@ -301,13 +317,11 @@ Do you want to use a Python virtual environment for Odoo?
         print("[OK] Odoo requirements installed system-wide.")
 
 ########################################
-# MEMORY CONFIGURATION
+# MEMORY CONFIG FOR ODOO WORKERS
 ########################################
 
 def detect_system_memory_mb():
-    """
-    Read /proc/meminfo to get total system memory in MB.
-    """
+    """Read /proc/meminfo to get total system memory in MB."""
     try:
         with open("/proc/meminfo") as f:
             data = f.read()
@@ -319,17 +333,15 @@ def detect_system_memory_mb():
         pass
     return 0
 
-def prompt_memory_config(state):
+def prompt_odoo_memory_config(state):
     """
-    Ask for memory-based tuning:
-    - Number of Odoo workers
-    - Possibly tune PostgreSQL memory, if desired
+    Ask for memory-based tuning for the number of Odoo worker processes.
+    We do NOT do PostgreSQL tuning here (that is in a separate menu item).
     """
     print("""
-Memory Configuration
---------------------
-We can help you choose an appropriate number of Odoo worker processes and optionally
-tweak PostgreSQL's memory parameters based on your server RAM.
+Odoo Memory Configuration (Workers)
+-----------------------------------
+We can suggest an appropriate number of Odoo worker processes based on your server RAM.
 """)
     sys_mem = detect_system_memory_mb()
     if sys_mem > 0:
@@ -337,13 +349,12 @@ tweak PostgreSQL's memory parameters based on your server RAM.
     else:
         print("[WARNING] Could not detect system memory from /proc/meminfo.")
 
-    choice = input("Do you want to configure memory-based tuning now? (y/n): ").strip().lower()
+    choice = input("Do you want to set workers based on memory? (y/n): ").strip().lower()
     if choice != 'y':
         return
 
-    # Odoo workers
+    # Basic heuristic
     default_workers = 2
-    # A rough heuristic: for every 1GB, you can have ~1-2 workers. This is simplistic.
     if sys_mem >= 2048 and sys_mem < 4096:
         default_workers = 2
     elif sys_mem >= 4096 and sys_mem < 8192:
@@ -358,72 +369,68 @@ tweak PostgreSQL's memory parameters based on your server RAM.
     if not workers_in:
         workers_in = str(default_workers)
     state['workers'] = workers_in
+    print(f"[OK] Worker count set to {workers_in}. Remember to update your Odoo config if needed.")
 
-    # PostgreSQL memory tweaks (shared_buffers, work_mem, etc.)
-    pg_tune_choice = input("\nTune PostgreSQL memory parameters? (y/n): ").strip().lower()
-    if pg_tune_choice == 'y':
-        # A basic approach: shared_buffers ~ 25% of system RAM (in MB)
-        # work_mem / maintenance_work_mem are smaller chunks
-        if sys_mem > 0:
-            sbuff = sys_mem // 4  # 25%
-            shared_buffers = f"{sbuff}MB"  # e.g. "1024MB"
-            work_mem = "16MB"
-            maintenance_work_mem = "64MB"
+########################################
+# ADVANCED POSTGRES TUNING
+########################################
 
-            custom_sb = input(f"shared_buffers? (default: {shared_buffers}): ").strip()
-            if custom_sb:
-                shared_buffers = custom_sb
+def advanced_postgres_tuning():
+    """
+    Move advanced PG memory tuning to a separate menu item, as requested.
+    """
+    print("""
+Advanced PostgreSQL Tuning
+--------------------------
+This will let you set shared_buffers, work_mem, and maintenance_work_mem.
 
-            custom_wm = input(f"work_mem? (default: {work_mem}): ").strip()
-            if custom_wm:
-                work_mem = custom_wm
+Warning: Always ensure these values are correct for your hardware.
+""")
+    proceed = input("Do you want to proceed with advanced PG tuning? (y/n): ").strip().lower()
+    if proceed != 'y':
+        print("[INFO] Skipping advanced PG tuning.")
+        return
 
-            custom_mw = input(f"maintenance_work_mem? (default: {maintenance_work_mem}): ").strip()
-            if custom_mw:
-                maintenance_work_mem = custom_mw
+    # Usually postgresql 16 in Ubuntu 24.04
+    pg_conf = "/etc/postgresql/16/main/postgresql.conf"
+    if not os.path.isfile(pg_conf):
+        # fallback if 16 not found
+        pg_conf = "/etc/postgresql/14/main/postgresql.conf"
 
-            # Write to postgresql.conf
-            run_cmd("systemctl stop postgresql")
-            # Typically at /etc/postgresql/14/main/postgresql.conf or /etc/postgresql/16/main
-            # We'll try version detection, but let's assume 16 for Ubuntu 24.04
-            pg_conf = "/etc/postgresql/16/main/postgresql.conf"
-            if not os.path.isfile(pg_conf):
-                pg_conf = "/etc/postgresql/14/main/postgresql.conf"
+    shared_buffers = input("shared_buffers? (e.g. 2GB) [Press enter to skip]: ").strip()
+    work_mem = input("work_mem? (e.g. 16MB) [Press enter to skip]: ").strip()
+    maintenance_work_mem = input("maintenance_work_mem? (e.g. 64MB) [Press enter to skip]: ").strip()
 
-            # We'll do naive string replace for demonstration
-            # A more robust approach might parse the file.
-            with open(pg_conf, 'r') as f:
-                lines = f.readlines()
+    run_cmd("systemctl stop postgresql")
 
-            new_lines = []
-            for line in lines:
-                if line.strip().startswith("shared_buffers"):
-                    new_lines.append(f"shared_buffers = {shared_buffers}\n")
-                elif line.strip().startswith("work_mem"):
-                    new_lines.append(f"work_mem = {work_mem}\n")
-                elif line.strip().startswith("maintenance_work_mem"):
-                    new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
-                else:
-                    new_lines.append(line)
-
-            # If not found, we can just append
-            if not any("shared_buffers" in l for l in new_lines):
-                new_lines.append(f"\nshared_buffers = {shared_buffers}\n")
-            if not any("work_mem" in l for l in new_lines):
-                new_lines.append(f"work_mem = {work_mem}\n")
-            if not any("maintenance_work_mem" in l for l in new_lines):
-                new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
-
-            with open(pg_conf, 'w') as f:
-                f.write("".join(new_lines))
-
-            run_cmd("systemctl start postgresql")
-            print("[OK] PostgreSQL memory parameters updated and service restarted.")
+    # We'll do naive replacements or appends
+    with open(pg_conf, 'r') as f:
+        lines = f.readlines()
+    new_lines = []
+    for line in lines:
+        # Comments won't get replaced automatically, but let's keep it simple
+        if shared_buffers and line.strip().startswith("shared_buffers"):
+            new_lines.append(f"shared_buffers = {shared_buffers}\n")
+        elif work_mem and line.strip().startswith("work_mem"):
+            new_lines.append(f"work_mem = {work_mem}\n")
+        elif maintenance_work_mem and line.strip().startswith("maintenance_work_mem"):
+            new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
         else:
-            print("[ERROR] Could not detect system memory. Skipping PG tuning.")
+            new_lines.append(line)
 
-    print("[OK] Memory configuration saved to script state.")
-    print("Remember to re-run 'Configure Odoo' if you want to update your Odoo config file with the new worker count.")
+    # If not found, we append lines at the end
+    if shared_buffers and not any("shared_buffers" in l for l in new_lines):
+        new_lines.append(f"\nshared_buffers = {shared_buffers}\n")
+    if work_mem and not any("work_mem" in l for l in new_lines):
+        new_lines.append(f"work_mem = {work_mem}\n")
+    if maintenance_work_mem and not any("maintenance_work_mem" in l for l in new_lines):
+        new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
+
+    with open(pg_conf, 'w') as f:
+        f.write("".join(new_lines))
+
+    run_cmd("systemctl start postgresql")
+    print("[OK] PostgreSQL advanced tuning applied and service restarted.")
 
 ########################################
 # CONFIGURE ODOO
@@ -431,7 +438,7 @@ tweak PostgreSQL's memory parameters based on your server RAM.
 
 def configure_odoo(state):
     """
-    Prompt for Odoo config (master password, workers, etc.), then write to /etc/odoo.conf.
+    Prompt for Odoo config (master password, workers, etc.), then write /etc/odoo.conf.
     """
     print("""
 Odoo Configuration
@@ -473,7 +480,6 @@ Odoo Configuration
         workers_in = default_workers
 
     install_path = state.get('install_path', '/opt/odoo18')
-
     conf_path = "/etc/odoo.conf"
     content = f"""[options]
 ; Odoo 18 Configuration File
@@ -740,7 +746,7 @@ def configure_firewall():
     print("""
 UFW Firewall Configuration
 --------------------------
-We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and 8069 for Odoo (optionally).
+We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and optionally 8069 for Odoo direct access.
 """)
     choice = input("Do you want to install and configure UFW? (y/n): ").strip().lower()
     if choice != 'y':
@@ -768,25 +774,37 @@ We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and 8069 for Odoo (optionally
 
 def run_full_wizard(state):
     """
-    Run all steps in a sequence, following a standard approach
-    (similar to the Cybrosys blog instructions for Odoo 18).
+    Run all steps in a typical sequence:
+    1. Check/upgrade Python
+    2. Install dependencies (including Node.js/wkhtmltopdf)
+    3. Configure DB
+    4. Clone and install Odoo 18
+    5. Memory config for Odoo workers
+    6. Configure Odoo
+    7. Create systemd service
+    8. Prompt for CF SSL
+    9. Issue CF SSL
+    10. Configure Nginx
+    11. SSH Hardening
+    12. Firewall
     """
     check_python_version()
     prompt_install_dependencies()
     configure_database(state)
     setup_odoo(state)
-    prompt_memory_config(state)   # memory-based tuning
+    prompt_odoo_memory_config(state)
     configure_odoo(state)
     create_odoo_service(state)
-    prompt_cloudflare(state)  # collect info
+    prompt_cloudflare(state)
     setup_cloudflare_ssl(state)
     configure_nginx(state)
     harden_ssh()
     configure_firewall()
+
     print("\n[Installation Complete]")
     print("=========================================")
-    print("Odoo should now be running on port 8069. If you configured")
-    print("Nginx and SSL, then your domain should serve Odoo over HTTPS.")
+    print("Odoo 18 should now be running on port 8069. If you configured")
+    print("Nginx and SSL, your domain should serve Odoo over HTTPS.")
     print("=========================================")
 
 ########################################
@@ -799,43 +817,49 @@ def main_menu(state):
 =================================
  Main Menu
 =================================
-1) Run Complete Setup Wizard
-2) Database Setup/Update
-3) Odoo Setup/Update
-4) Memory Config & Tuning
-5) Configure Odoo (Config File)
-6) Create/Update Odoo Service
-7) Configure Domain / Cloudflare
-8) Issue/Install SSL Certificate
-9) Configure Nginx Reverse Proxy
-10) SSH Hardening
-11) Configure Firewall
-12) Exit
+1) Full Odoo 18 Installation (Wizard)
+2) Install Dependencies (Nodejs, Wkhtml, etc.)
+3) Database Setup/Update
+4) Odoo Setup/Update (Clone & Python deps)
+5) Odoo Memory Config (Workers)
+6) Configure Odoo (Write /etc/odoo.conf)
+7) Create/Update Odoo Systemd Service
+8) Configure Domain / Cloudflare
+9) Issue/Install SSL Certificate
+10) Configure Nginx Reverse Proxy
+11) SSH Hardening
+12) Configure Firewall
+13) Advanced PostgreSQL Tuning (Separate)
+14) Exit
 """)
         choice = input("Select an option: ").strip()
         if choice == "1":
             run_full_wizard(state)
         elif choice == "2":
-            configure_database(state)
+            prompt_install_dependencies()
         elif choice == "3":
-            setup_odoo(state)
+            configure_database(state)
         elif choice == "4":
-            prompt_memory_config(state)
+            setup_odoo(state)
         elif choice == "5":
-            configure_odoo(state)
+            prompt_odoo_memory_config(state)
         elif choice == "6":
-            create_odoo_service(state)
+            configure_odoo(state)
         elif choice == "7":
-            prompt_cloudflare(state)
+            create_odoo_service(state)
         elif choice == "8":
-            setup_cloudflare_ssl(state)
+            prompt_cloudflare(state)
         elif choice == "9":
-            configure_nginx(state)
+            setup_cloudflare_ssl(state)
         elif choice == "10":
-            harden_ssh()
+            configure_nginx(state)
         elif choice == "11":
-            configure_firewall()
+            harden_ssh()
         elif choice == "12":
+            configure_firewall()
+        elif choice == "13":
+            advanced_postgres_tuning()
+        elif choice == "14":
             print("[INFO] Exiting.")
             break
         else:
@@ -846,12 +870,9 @@ def main():
     check_root()
     detect_ubuntu()
 
-    # We store dynamic states here, e.g. db info, domain, memory settings, etc.
+    # We store dynamic states here, e.g. DB info, domain, memory settings, etc.
     state = {}
 
     main_menu(state)
-    print("\n[Done] Thanks for using the Odoo 18 Setup & Management Tool!\n")
-
-if __name__ == "__main__":
-    main()
+    print("\n[Done] Thanks for using the Odoo 18 Setup & Ma
 
