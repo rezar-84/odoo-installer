@@ -874,5 +874,8 @@ def main():
     state = {}
 
     main_menu(state)
-    print("\n[Done] Thanks for using the Odoo 18 Setup & Ma
+    print("\n[Done] Thanks for using the Odoo 18 Setup & Management Tool!\n")
+
+if __name__ == "__main__":
+    main()
 
