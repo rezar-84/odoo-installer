@@ -2,107 +2,145 @@
 
 import os
 import sys
+import json
 import subprocess
 import platform
 import re
+import time
+
+STATE_FILE = "/etc/odoo_install_state.json"
+LOG_FILE = "/var/log/odoo_install.log"
 
 ########################################
-# HELPER FUNCTIONS
+# Logging Functions
 ########################################
 
-def print_ascii_banner():
-    banner = r"""
-   ____  ____          __
-  / __ \/ __ \___  ___/ /
- / / / / /_/ / _ \/ _  / 
-/ /_/ / _, _/  __/ __/  
-\____/_/ |_|\___/_/     
-   O D O O   W i z a r d
-
-====================================
-Welcome to the Odoo 18 Installer for Ubuntu 24.04
-====================================
-"""
-    print(banner)
-
-def check_root():
-    """Check if the script is running as root."""
-    if os.geteuid() != 0:
-        print("\n[Error] You must run this script as root or with sudo.\n")
-        sys.exit(1)
-
-def detect_ubuntu():
-    """Check if the OS is Ubuntu 24.04."""
-    os_info = platform.platform().lower()
-    if "ubuntu" not in os_info:
-        print("\n[Warning] This script is designed for Ubuntu 24.04. Proceed with caution.")
-    else:
-        print("[OK] Ubuntu detected.")
+def log(msg):
+    """Append a message to the log file and print to console."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}\n"
+    print(line.strip())
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(line)
+    except IOError:
+        print(f"[WARN] Could not write to log file {LOG_FILE}.")
 
 def run_cmd(cmd, capture_output=False):
-    """Helper to run shell commands, printing them first."""
-    print(f"\n[CMD] {cmd}")
+    """Helper to run shell commands, logs them, prints output if errors occur."""
+    log(f"RUN CMD: {cmd}")
     if capture_output:
         result = subprocess.run(cmd, shell=True, check=False,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return result.stdout.decode('utf-8'), result.stderr.decode('utf-8')
+        stdout = result.stdout.decode('utf-8')
+        stderr = result.stderr.decode('utf-8')
+        if result.returncode != 0:
+            log(f"[ERROR] Command failed with code {result.returncode}")
+            log(f"STDERR: {stderr}")
+        return (stdout, stderr, result.returncode)
     else:
-        subprocess.run(cmd, shell=True, check=False)
+        result = subprocess.run(cmd, shell=True, check=False)
+        if result.returncode != 0:
+            log(f"[ERROR] Command '{cmd}' failed with code {result.returncode}")
+        return (None, None, result.returncode)
 
 ########################################
-# PYTHON CHECK/INSTALL
+# State Persistence
+########################################
+
+def load_state():
+    """Load non-sensitive state from /etc/odoo_install_state.json, if present."""
+    if os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                data = json.load(f)
+            # Make sure it's a dict
+            if isinstance(data, dict):
+                log("[INFO] Loaded existing install state.")
+                return data
+        except Exception as e:
+            log(f"[WARN] Could not parse state file: {e}")
+    return {}
+
+def save_state(state):
+    """Save non-sensitive data to /etc/odoo_install_state.json."""
+    # We do NOT store passwords for safety
+    state_copy = dict(state)
+    # Remove any known password fields
+    state_copy.pop('db_pass', None)
+    state_copy.pop('api_token', None)
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state_copy, f, indent=2)
+        log("[INFO] Saved state (excluding passwords).")
+    except Exception as e:
+        log(f"[WARN] Could not save state: {e}")
+
+########################################
+# Root / OS checks
+########################################
+
+def check_root():
+    if os.geteuid() != 0:
+        log("[ERROR] You must run this script as root or with sudo.")
+        sys.exit(1)
+
+def detect_ubuntu():
+    os_info = platform.platform().lower()
+    if "ubuntu" not in os_info:
+        log("[WARN] This script is designed for Ubuntu 24.04. Proceed with caution.")
+    else:
+        log("[OK] Ubuntu detected.")
+
+########################################
+# Utility
+########################################
+
+def user_exists(user_name):
+    cmd = f"id -u {user_name}"
+    proc = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return proc.returncode == 0
+
+def ensure_dir(d):
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d)
+            log(f"[INFO] Created directory {d}.")
+        except Exception as e:
+            log(f"[ERROR] Could not create directory {d}: {e}")
+
+########################################
+# Steps
 ########################################
 
 def check_python_version():
-    """
-    Check if Python >= 3.11 is installed.
-    Ask user if they want to install/upgrade to 3.11 or 3.12.
-    """
-    print("\n[Step] Checking Python version...")
-    version_output, _ = run_cmd("python3 --version", capture_output=True)
-    if version_output:
-        parts = version_output.strip().split()
+    log("Checking Python version (>=3.11 recommended).")
+    stdout, stderr, rc = run_cmd("python3 --version", capture_output=True)
+    if stdout:
+        parts = stdout.strip().split()
         if len(parts) == 2 and parts[0].lower() == "python":
-            major, minor, *_ = parts[1].split(".")
-            major = int(major)
-            minor = int(minor)
-            if (major == 3 and minor >= 11) or (major > 3):
-                print(f"[OK] Detected Python {major}.{minor}. No upgrade needed.")
-                return
-            else:
-                print(f"[Warning] Python {major}.{minor} is lower than 3.11.")
+            maj, min, *_ = parts[1].split(".")
+            try:
+                maj = int(maj)
+                min = int(min)
+                if (maj == 3 and min >= 11) or (maj > 3):
+                    log(f"[OK] Detected Python {maj}.{min}.")
+                    return
+                else:
+                    log(f"[WARN] Python {maj}.{min} is lower than 3.11.")
+            except:
+                pass
         else:
-            print("[Warning] Unable to parse Python version.")
+            log("[WARN] Unable to parse Python version.")
     else:
-        print("[Warning] python3 not found or version is unknown.")
+        log("[WARN] python3 not found or version unknown.")
 
-    print("""
-We recommend Python 3.11 or 3.12 for Odoo 18.
-1) Install/upgrade to Python 3.11
-2) Install/upgrade to Python 3.12
-3) Continue without upgrading (not recommended)
+    log("""We recommend Python 3.11 or 3.12 for Odoo 18.
+Please install or upgrade manually if needed, or proceed if you have custom setup.
 """)
-    choice = input("Choose an option (1/2/3): ").strip()
-    if choice == "1":
-        run_cmd("apt update && apt install -y python3.11 python3.11-venv python3.11-dev")
-        run_cmd("update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1")
-    elif choice == "2":
-        run_cmd("apt update && apt install -y software-properties-common")
-        run_cmd("add-apt-repository ppa:deadsnakes/ppa -y")
-        run_cmd("apt update && apt install -y python3.12 python3.12-venv python3.12-dev")
-        run_cmd("update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1")
-    else:
-        print("[INFO] Continuing without upgrading Python...")
-
-########################################
-# INSTALL CORE DEPENDENCIES
-########################################
 
 def prompt_install_dependencies():
-    """
-    Prompt user to install typical system dependencies for Odoo 18,
-    including Node.js, yarn, wkhtmltopdf, etc.
-    """
+    log("Prompting user to install system dependencies.")
     print("""
 We'll install required packages for Odoo 18 on Ubuntu 24.04, including:
 - git, curl, wget, nano, build-essential
@@ -110,55 +148,35 @@ We'll install required packages for Odoo 18 on Ubuntu 24.04, including:
 - libpq-dev, libxml2-dev, libxslt1-dev, zlib1g-dev, libjpeg-dev
 - nginx for reverse proxy
 - nodejs, npm, yarn (for Odoo assets)
-- wkhtmltopdf (for printing PDFs)
+- wkhtmltopdf (for PDF reports)
+
 Install dependencies now?
 1) Yes
 2) No
 """)
-    choice = input("Choose an option (1/2): ").strip()
+    choice = input("Choose (1/2): ").strip()
     if choice == "1":
-        # Basic system deps
-        base_deps = [
+        deps = [
             "git", "curl", "wget", "nano", "build-essential", "python3-pip",
             "libpq-dev", "libxml2-dev", "libxslt1-dev", "zlib1g-dev", "libjpeg-dev",
-            "postgresql", "postgresql-contrib", "nginx", "xfonts-75dpi", "xfonts-base"
+            "postgresql", "postgresql-contrib", "nginx", "xfonts-75dpi", "xfonts-base",
+            "wkhtmltopdf"
         ]
         run_cmd("apt update")
-        run_cmd(f"apt install -y {' '.join(base_deps)}")
+        run_cmd(f"apt install -y {' '.join(deps)}")
 
-        # Node.js, Yarn, wkhtmltopdf
-        print("[INFO] Installing Node.js, npm, yarn, wkhtmltopdf...")
-        # For Node 16/18/20, you might prefer official NodeSource, e.g.:
+        # Node & Yarn
+        log("Installing Node.js 18.x and yarn globally.")
         run_cmd("curl -sL https://deb.nodesource.com/setup_18.x | bash -")
         run_cmd("apt install -y nodejs npm")
-
-        # Yarn
         run_cmd("npm install -g yarn")
 
-        # Wkhtmltopdf (the older 0.12.5 is usually recommended, but let's do standard apt for now)
-        run_cmd("apt install -y wkhtmltopdf")
-
-        print("[OK] Dependencies installed.")
-
-########################################
-# DATABASE SETUP / CHECK
-########################################
-
-def db_exists(db_name):
-    cmd = f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='{db_name}';\""
-    out, _ = run_cmd(cmd, capture_output=True)
-    return out.strip() == "1"
-
-def db_user_exists(db_user):
-    cmd = f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{db_user}';\""
-    out, _ = run_cmd(cmd, capture_output=True)
-    return out.strip() == "1"
+        log("[OK] Dependencies installed.")
+    else:
+        log("[INFO] Skipping dependency installation.")
 
 def configure_database(state):
-    """
-    Configure or update database info.  
-    Stores db_name, db_user, db_pass into the state dict.
-    """
+    log("Configuring PostgreSQL database.")
     print("""
 PostgreSQL Database Configuration
 ---------------------------------
@@ -169,159 +187,196 @@ PostgreSQL Database Configuration
     if choice != "1":
         return
 
-    db_name = input("Enter DB name (default: odoo18db): ").strip()
-    if not db_name:
-        db_name = "odoo18db"
+    db_name = input("Enter DB name (default: odoo18db): ").strip() or "odoo18db"
+    db_user = input("Enter DB user (default: odoo): ").strip() or "odoo"
+    db_pass = input("Enter DB password (default: odoo): ").strip() or "odoo"
 
-    db_user = input("Enter DB user (default: odoo): ").strip()
-    if not db_user:
-        db_user = "odoo"
-
-    db_pass = input("Enter DB password (default: odoo): ").strip()
-    if not db_pass:
-        db_pass = "odoo"
-
-    # Ensure Postgres is running
-    run_cmd("systemctl enable postgresql && systemctl start postgresql")
-
-    # Check if user already exists
-    if db_user_exists(db_user):
-        print(f"[INFO] DB user '{db_user}' already exists.")
-        reuse_user_choice = input("Do you want to reuse this user? (y/n): ").strip().lower()
-        if reuse_user_choice == 'n':
-            run_cmd(f"sudo -u postgres psql -c \"DROP ROLE {db_user};\"")
-            run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
-            print(f"[OK] Re-created user '{db_user}' with new password.")
-        else:
-            run_cmd(f"sudo -u postgres psql -c \"ALTER USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
-            print(f"[OK] User '{db_user}' reused, password updated.")
-    else:
-        run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
-        print(f"[OK] User '{db_user}' created.")
-
-    # Check if DB already exists
-    if db_exists(db_name):
-        print(f"[INFO] Database '{db_name}' already exists.")
-        reuse_db_choice = input("Do you want to reuse this database? (y/n): ").strip().lower()
-        if reuse_db_choice == "n":
-            run_cmd(f"sudo -u postgres psql -c \"DROP DATABASE {db_name};\"")
-            run_cmd(f"sudo -u postgres psql -c \"CREATE DATABASE {db_name} OWNER {db_user};\"")
-            print(f"[OK] Re-created database '{db_name}'.")
-        else:
-            print(f"[OK] Database '{db_name}' reused.")
-    else:
-        run_cmd(f"sudo -u postgres psql -c \"CREATE DATABASE {db_name} OWNER {db_user};\"")
-        print(f"[OK] Database '{db_name}' created, owned by '{db_user}'.")
-
-    # Store in state
+    # store in state (we do store db_pass temporarily, though we won't save it to JSON)
     state['db_name'] = db_name
     state['db_user'] = db_user
     state['db_pass'] = db_pass
-    print("[INFO] Database info updated in script state.")
 
-########################################
-# SYSTEM USER, ODOO SETUP
-########################################
+    run_cmd("systemctl enable postgresql && systemctl start postgresql")
 
-def system_user_exists(user_name):
-    cmd = f"id -u {user_name}"
-    proc = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return proc.returncode == 0
+    def db_exists(db):
+        out, err, rc = run_cmd(f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='{db}'\"",
+                               capture_output=True)
+        return out.strip() == "1"
+
+    def db_user_exists(user):
+        out, err, rc = run_cmd(f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{user}'\"",
+                               capture_output=True)
+        return out.strip() == "1"
+
+    if db_user_exists(db_user):
+        print(f"[INFO] DB user '{db_user}' already exists.")
+        reuse_user_choice = input("Do you want to recreate this user? (y/n): ").strip().lower()
+        if reuse_user_choice == "y":
+            run_cmd(f"sudo -u postgres psql -c \"DROP ROLE {db_user};\"")
+            run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
+            log(f"[OK] Re-created user '{db_user}'.")
+        else:
+            run_cmd(f"sudo -u postgres psql -c \"ALTER USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
+            log(f"[OK] Reusing user '{db_user}', updated password.")
+    else:
+        run_cmd(f"sudo -u postgres psql -c \"CREATE USER {db_user} WITH ENCRYPTED PASSWORD '{db_pass}';\"")
+        log(f"[OK] Created user '{db_user}'.")
+
+    if db_exists(db_name):
+        print(f"[INFO] Database '{db_name}' already exists.")
+        reuse_db_choice = input("Do you want to recreate this DB? (y/n): ").strip().lower()
+        if reuse_db_choice == "y":
+            run_cmd(f"sudo -u postgres psql -c \"DROP DATABASE {db_name};\"")
+            run_cmd(f"sudo -u postgres psql -c \"CREATE DATABASE {db_name} OWNER {db_user};\"")
+            log(f"[OK] Re-created database '{db_name}'.")
+        else:
+            log(f"[OK] Reusing database '{db_name}'.")
+    else:
+        run_cmd(f"sudo -u postgres psql -c \"CREATE DATABASE {db_name} OWNER {db_user};\"")
+        log(f"[OK] Created database '{db_name}', owned by '{db_user}'.")
+
+    log("[INFO] Database configuration complete.")
 
 def setup_odoo(state):
-    """
-    Prompt for Odoo version, install path, system user, venv, clone or reuse code.
-    Actually clones Odoo from github and installs requirements.
-    """
-    print("""
-Odoo Setup:
------------
-""")
-    # Default to 18.0
-    default_version = state.get('odoo_ver', '18.0')
-    odoo_ver = input(f"Which Odoo version? (default: {default_version}): ").strip()
-    if not odoo_ver:
-        odoo_ver = default_version
+    log("Setting up / updating Odoo source code.")
+    print("\n==== Odoo Setup / Update ====")
+    # Load defaults from state or use fallback
+    default_ver = state.get('odoo_ver', '18.0')
+    odoo_ver = input(f"Odoo version? (default: {default_ver}): ").strip() or default_ver
 
     default_path = state.get('install_path', '/opt/odoo18')
-    install_path = input(f"Install directory? (default: {default_path}): ").strip()
-    if not install_path:
-        install_path = default_path
+    install_path = input(f"Install directory? (default: {default_path}): ").strip() or default_path
 
     default_user = state.get('odoo_user', 'odoo')
-    odoo_user = input(f"System user for Odoo? (default: {default_user}): ").strip()
-    if not odoo_user:
-        odoo_user = default_user
+    odoo_user = input(f"System user for Odoo? (default: {default_user}): ").strip() or default_user
 
-    print("""
-Do you want to use a Python virtual environment for Odoo?
-1) Yes
-2) No (system-wide)
-""")
-    venv_choice = input("Choose (1/2): ").strip()
-    use_venv = (venv_choice == "1")
+    print("\nDo you want to use a Python virtual environment for Odoo?\n1) Yes\n2) No (system-wide)")
+    use_venv_choice = input("Choose (1/2): ").strip()
+    use_venv = (use_venv_choice == "1")
 
-    # Save to state
+    # Update state
     state['odoo_ver'] = odoo_ver
     state['install_path'] = install_path
     state['odoo_user'] = odoo_user
     state['use_venv'] = use_venv
 
-    # Create or reuse system user
-    if system_user_exists(odoo_user):
+    # create user if needed
+    if user_exists(odoo_user):
         print(f"[INFO] System user '{odoo_user}' already exists.")
-        reuse_user_choice = input("Do you want to reuse this user? (y/n): ").strip().lower()
-        if reuse_user_choice == 'n':
+        ch = input("Recreate user? (y/n): ").strip().lower()
+        if ch == 'y':
             run_cmd(f"userdel -r {odoo_user}")
             run_cmd(f"useradd -m -d {install_path} -U -r -s /bin/bash {odoo_user}")
-            print(f"[OK] Re-created system user '{odoo_user}'.")
+            log(f"[OK] Re-created user '{odoo_user}'.")
         else:
-            print(f"[OK] Reusing existing user '{odoo_user}'.")
+            log(f"[OK] Reusing existing user '{odoo_user}'.")
     else:
         run_cmd(f"useradd -m -d {install_path} -U -r -s /bin/bash {odoo_user}")
-        print(f"[OK] Created system user '{odoo_user}'.")
+        log(f"[OK] Created user '{odoo_user}'.")
 
-    # Clone or reuse Odoo code
-    if os.path.isdir(install_path) and os.path.isdir(os.path.join(install_path, ".git")):
-        print(f"[INFO] Found existing Odoo installation at {install_path}.")
-        reuse_odoo_choice = input("Do you want to reuse this Odoo directory? (y/n): ").strip().lower()
-        if reuse_odoo_choice == 'n':
-            run_cmd(f"rm -rf {install_path}")
-            run_cmd(f"git clone --depth 1 --branch {odoo_ver} https://github.com/odoo/odoo.git {install_path}")
-            print(f"[OK] Downloaded fresh Odoo {odoo_ver} to {install_path}")
+    # check if directory has .git
+    if os.path.isdir(install_path):
+        git_path = os.path.join(install_path, ".git")
+        if os.path.isdir(git_path):
+            print(f"[INFO] Found .git at {install_path}. Reuse or re-clone?")
+            ch2 = input("Reuse existing Odoo directory? (y/n): ").strip().lower()
+            if ch2 == 'n':
+                run_cmd(f"rm -rf {install_path}")
+                clone_odoo(odoo_ver, install_path)
         else:
-            print("[OK] Reusing existing Odoo directory.")
+            print(f"[WARN] {install_path} exists but no .git.")
+            fix = input("Remove and clone fresh? (y/n): ").strip().lower()
+            if fix == 'y':
+                run_cmd(f"rm -rf {install_path}")
+                clone_odoo(odoo_ver, install_path)
+            else:
+                log("[WARN] Skipping clone. Directory may be incomplete.")
     else:
-        run_cmd(f"git clone --depth 1 --branch {odoo_ver} https://github.com/odoo/odoo.git {install_path}")
-        print(f"[OK] Downloaded Odoo {odoo_ver} to {install_path}")
+        clone_odoo(odoo_ver, install_path)
 
-    # Adjust ownership
+    # chown
     run_cmd(f"chown -R {odoo_user}:{odoo_user} {install_path}")
 
-    # Set up venv or system-wide
+    # venv
     if use_venv:
         venv_path = os.path.join(install_path, "venv")
         if os.path.isdir(venv_path):
-            print("[INFO] Virtual environment already exists.")
-            reuse_venv_choice = input("Reuse existing venv? (y/n): ").strip().lower()
-            if reuse_venv_choice == 'n':
+            print("[INFO] venv exists. Recreate? (y/n)")
+            c = input().strip().lower()
+            if c == 'y':
                 run_cmd(f"rm -rf {venv_path}")
-                run_cmd(f"python3 -m venv {venv_path}")
+                create_venv(venv_path)
         else:
-            run_cmd(f"python3 -m venv {venv_path}")
+            create_venv(venv_path)
 
-        run_cmd(f"source {venv_path}/bin/activate && pip install --upgrade pip && pip install -r {install_path}/requirements.txt && deactivate")
-        print("[OK] Odoo requirements installed in venv.")
+        install_requirements_venv(install_path, venv_path)
     else:
-        run_cmd(f"pip install --upgrade pip && pip install -r {install_path}/requirements.txt")
-        print("[OK] Odoo requirements installed system-wide.")
+        install_requirements_system(install_path)
+
+    log("[DONE] Odoo setup or update complete.")
+
+def clone_odoo(odoo_ver, install_path):
+    log(f"Cloning Odoo branch {odoo_ver} into {install_path}.")
+    out, err, rc = run_cmd(
+        f"git clone --depth 1 --branch {odoo_ver} https://github.com/odoo/odoo.git {install_path}",
+        capture_output=True
+    )
+    if rc != 0:
+        log(f"[ERROR] Git clone failed. Branch might not exist or no network. Return code: {rc}")
+
+def create_venv(path):
+    log(f"Creating virtual environment at {path}")
+    run_cmd(f"python3 -m venv {path}")
+    log("[OK] venv created.")
+
+def install_requirements_venv(install_path, venv_path):
+    req_file = os.path.join(install_path, "requirements.txt")
+    if not os.path.isfile(req_file):
+        log("[WARN] No requirements.txt found in Odoo directory. Skipping pip.")
+        return
+    cmd = (
+        f"bash -c 'source {venv_path}/bin/activate && "
+        f"pip install --upgrade pip && "
+        f"pip install -r {req_file} && deactivate'"
+    )
+    run_cmd(cmd)
+
+def install_requirements_system(install_path):
+    req_file = os.path.join(install_path, "requirements.txt")
+    if not os.path.isfile(req_file):
+        log("[WARN] No requirements.txt found in Odoo directory. Skipping system-wide pip install.")
+        return
+    cmd = f"pip install --upgrade pip && pip install -r {req_file}"
+    run_cmd(cmd)
 
 ########################################
-# MEMORY CONFIG FOR ODOO WORKERS
+# Memory / Worker Config
 ########################################
+
+def prompt_odoo_memory_config(state):
+    log("Prompting for Odoo memory-based worker config.")
+    mem = detect_system_memory_mb()
+    if mem <= 0:
+        log("[WARN] Could not detect system memory from /proc/meminfo.")
+    else:
+        log(f"[INFO] Detected ~{mem} MB system memory.")
+
+    print("\nWe can suggest worker count based on memory. Press ENTER to skip or accept default.")
+    default_workers = 2
+    if mem >= 4096 and mem < 8192:
+        default_workers = 4
+    elif mem >= 8192 and mem < 16384:
+        default_workers = 6
+    elif mem >= 16384:
+        default_workers = 8
+
+    workers = input(f"Number of Odoo workers? (default {default_workers}): ").strip()
+    if not workers:
+        workers = str(default_workers)
+    state['workers'] = workers
+    log(f"[OK] Set workers to {workers} (in state only).")
 
 def detect_system_memory_mb():
-    """Read /proc/meminfo to get total system memory in MB."""
     try:
         with open("/proc/meminfo") as f:
             data = f.read()
@@ -333,156 +388,108 @@ def detect_system_memory_mb():
         pass
     return 0
 
-def prompt_odoo_memory_config(state):
-    """
-    Ask for memory-based tuning for the number of Odoo worker processes.
-    We do NOT do PostgreSQL tuning here (that is in a separate menu item).
-    """
-    print("""
-Odoo Memory Configuration (Workers)
------------------------------------
-We can suggest an appropriate number of Odoo worker processes based on your server RAM.
-""")
-    sys_mem = detect_system_memory_mb()
-    if sys_mem > 0:
-        print(f"[INFO] Detected ~{sys_mem} MB system memory.")
-    else:
-        print("[WARNING] Could not detect system memory from /proc/meminfo.")
-
-    choice = input("Do you want to set workers based on memory? (y/n): ").strip().lower()
-    if choice != 'y':
-        return
-
-    # Basic heuristic
-    default_workers = 2
-    if sys_mem >= 2048 and sys_mem < 4096:
-        default_workers = 2
-    elif sys_mem >= 4096 and sys_mem < 8192:
-        default_workers = 4
-    elif sys_mem >= 8192 and sys_mem < 16384:
-        default_workers = 6
-    elif sys_mem >= 16384:
-        default_workers = 8
-
-    prompt_text = f"Number of Odoo worker processes? (default: {default_workers}): "
-    workers_in = input(prompt_text).strip()
-    if not workers_in:
-        workers_in = str(default_workers)
-    state['workers'] = workers_in
-    print(f"[OK] Worker count set to {workers_in}. Remember to update your Odoo config if needed.")
-
 ########################################
 # ADVANCED POSTGRES TUNING
 ########################################
 
 def advanced_postgres_tuning():
-    """
-    Move advanced PG memory tuning to a separate menu item, as requested.
-    """
+    log("[INFO] Attempting advanced PostgreSQL memory tuning.")
     print("""
 Advanced PostgreSQL Tuning
 --------------------------
-This will let you set shared_buffers, work_mem, and maintenance_work_mem.
-
-Warning: Always ensure these values are correct for your hardware.
+Set shared_buffers, work_mem, maintenance_work_mem, etc.
+Example: 2GB, 16MB, 64MB
 """)
-    proceed = input("Do you want to proceed with advanced PG tuning? (y/n): ").strip().lower()
-    if proceed != 'y':
-        print("[INFO] Skipping advanced PG tuning.")
+    c = input("Proceed? (y/n): ").strip().lower()
+    if c != 'y':
         return
 
     # Usually postgresql 16 in Ubuntu 24.04
     pg_conf = "/etc/postgresql/16/main/postgresql.conf"
     if not os.path.isfile(pg_conf):
-        # fallback if 16 not found
         pg_conf = "/etc/postgresql/14/main/postgresql.conf"
 
-    shared_buffers = input("shared_buffers? (e.g. 2GB) [Press enter to skip]: ").strip()
-    work_mem = input("work_mem? (e.g. 16MB) [Press enter to skip]: ").strip()
-    maintenance_work_mem = input("maintenance_work_mem? (e.g. 64MB) [Press enter to skip]: ").strip()
+    sb = input("shared_buffers (e.g. 2GB) [skip if blank]: ").strip()
+    wm = input("work_mem (e.g. 16MB) [skip if blank]: ").strip()
+    mm = input("maintenance_work_mem (e.g. 64MB) [skip if blank]: ").strip()
 
     run_cmd("systemctl stop postgresql")
 
-    # We'll do naive replacements or appends
     with open(pg_conf, 'r') as f:
         lines = f.readlines()
-    new_lines = []
-    for line in lines:
-        # Comments won't get replaced automatically, but let's keep it simple
-        if shared_buffers and line.strip().startswith("shared_buffers"):
-            new_lines.append(f"shared_buffers = {shared_buffers}\n")
-        elif work_mem and line.strip().startswith("work_mem"):
-            new_lines.append(f"work_mem = {work_mem}\n")
-        elif maintenance_work_mem and line.strip().startswith("maintenance_work_mem"):
-            new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
-        else:
-            new_lines.append(line)
 
-    # If not found, we append lines at the end
-    if shared_buffers and not any("shared_buffers" in l for l in new_lines):
-        new_lines.append(f"\nshared_buffers = {shared_buffers}\n")
-    if work_mem and not any("work_mem" in l for l in new_lines):
-        new_lines.append(f"work_mem = {work_mem}\n")
-    if maintenance_work_mem and not any("maintenance_work_mem" in l for l in new_lines):
-        new_lines.append(f"maintenance_work_mem = {maintenance_work_mem}\n")
+    def set_or_append(param, val, lines):
+        found = False
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith(param):
+                new_lines.append(f"{param} = {val}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"\n{param} = {val}\n")
+        return new_lines
+
+    new_lines = lines
+    if sb:
+        new_lines = set_or_append("shared_buffers", sb, new_lines)
+    if wm:
+        new_lines = set_or_append("work_mem", wm, new_lines)
+    if mm:
+        new_lines = set_or_append("maintenance_work_mem", mm, new_lines)
 
     with open(pg_conf, 'w') as f:
         f.write("".join(new_lines))
 
     run_cmd("systemctl start postgresql")
-    print("[OK] PostgreSQL advanced tuning applied and service restarted.")
+    log("[OK] Postgres advanced tuning applied.")
 
 ########################################
-# CONFIGURE ODOO
+# Configure Odoo
 ########################################
 
 def configure_odoo(state):
-    """
-    Prompt for Odoo config (master password, workers, etc.), then write /etc/odoo.conf.
-    """
+    log("[INFO] Configuring Odoo parameters.")
+    db_name = state.get('db_name', 'odoo18db')
+    db_user = state.get('db_user', 'odoo')
+    db_pass = state.get('db_pass', 'odoo')  # Not saved to JSON; might be missing if user never typed it
+
+    print("\n===== Odoo Configuration =====")
+    admin_passwd = input("Master (admin) password? (default: admin): ").strip() or "admin"
+
+    # If db wasn't set up, let them override
+    db_host = "localhost"
+    db_port = "5432"
+
+    # Worker count
+    default_workers = state.get('workers', '4')
+    workers = input(f"Workers? (default {default_workers}): ").strip() or default_workers
+
     print("""
-Odoo Configuration
-------------------
+We have optional memory/time limits. 
+1) Use recommended defaults 
+2) Enter custom values
 """)
-    admin_passwd = input("Master (admin) password for Odoo? (default: admin): ").strip()
-    if not admin_passwd:
-        admin_passwd = "admin"
-
-    db_host = "False"
-    db_port = "False"
-
-    # If user previously configured DB in state
-    db_name = state.get('db_name')
-    db_user = state.get('db_user')
-    db_pass = state.get('db_pass')
-
-    if db_name:
-        # We'll assume local
-        db_host = "localhost"
-        db_port = "5432"
+    c = input("Choose (1/2): ").strip()
+    if c == "2":
+        limit_memory_hard = input("limit_memory_hard (bytes)? [2GB=2147483648]: ").strip() or "2147483648"
+        limit_memory_soft = input("limit_memory_soft (bytes)? [1GB=1073741824]: ").strip() or "1073741824"
+        limit_time_cpu   = input("limit_time_cpu (sec)? (default 60): ").strip() or "60"
+        limit_time_real  = input("limit_time_real (sec)? (default 120): ").strip() or "120"
+        limit_request    = input("limit_request? (default 8192): ").strip() or "8192"
     else:
-        db_host_input = input("DB Host? (default: False for local socket): ").strip()
-        if db_host_input:
-            db_host = db_host_input
-        db_port_input = input("DB Port? (default: False): ").strip()
-        if db_port_input:
-            db_port = db_port_input
-
-        if not db_user:
-            db_user = "odoo"
-        if not db_pass:
-            db_pass = "False"
-
-    # If we have a memory-based workers setting in state, use that as a default
-    default_workers = state.get('workers', '2')
-    workers_in = input(f"Number of worker processes? (default: {default_workers}): ").strip()
-    if not workers_in:
-        workers_in = default_workers
+        limit_memory_hard = "2147483648"
+        limit_memory_soft = "1073741824"
+        limit_time_cpu   = "60"
+        limit_time_real  = "120"
+        limit_request    = "8192"
 
     install_path = state.get('install_path', '/opt/odoo18')
     conf_path = "/etc/odoo.conf"
+
     content = f"""[options]
-; Odoo 18 Configuration File
+; Basic
 admin_passwd = {admin_passwd}
 db_host = {db_host}
 db_port = {db_port}
@@ -490,31 +497,37 @@ db_user = {db_user}
 db_password = {db_pass}
 addons_path = {install_path}/addons
 logfile = /var/log/odoo/odoo.log
-workers = {workers_in}
+
+; Workers / Performance
+workers = {workers}
+limit_memory_hard = {limit_memory_hard}
+limit_memory_soft = {limit_memory_soft}
+limit_time_cpu = {limit_time_cpu}
+limit_time_real = {limit_time_real}
+limit_request = {limit_request}
 """
+
+    ensure_dir("/var/log/odoo")
+    odoo_user = state.get('odoo_user', 'odoo')
+    run_cmd(f"chown -R {odoo_user}:{odoo_user} /var/log/odoo")
 
     with open(conf_path, 'w') as f:
         f.write(content)
 
-    odoo_user = state.get('odoo_user', 'odoo')
-    run_cmd(f"mkdir -p /var/log/odoo && chown -R {odoo_user} /var/log/odoo")
     run_cmd(f"chown root:root {conf_path} && chmod 640 {conf_path}")
+    log(f"[OK] Wrote Odoo configuration to {conf_path}.")
 
-    print(f"[OK] Wrote Odoo configuration to {conf_path}")
-    # Save to state
     state['admin_passwd'] = admin_passwd
-    state['workers'] = workers_in
+    state['workers'] = workers
     state['odoo_conf_path'] = conf_path
-    print("[INFO] Odoo configuration updated in script state.")
+    log("[INFO] Odoo configuration step complete.")
 
 ########################################
-# CREATE ODOO SERVICE
+# systemd Service
 ########################################
 
 def create_odoo_service(state):
-    """
-    Create or overwrite systemd service for Odoo 18.
-    """
+    log("[INFO] Creating or updating Odoo systemd service.")
     install_path = state.get('install_path', '/opt/odoo18')
     odoo_user = state.get('odoo_user', 'odoo')
     service_file = "/etc/systemd/system/odoo.service"
@@ -542,104 +555,80 @@ WantedBy=multi-user.target
 
     run_cmd("systemctl daemon-reload")
     run_cmd("systemctl enable --now odoo.service")
-    print("[OK] Odoo service started or restarted.")
+    log("[OK] Odoo service started or restarted.")
     state['service_file'] = service_file
 
 ########################################
-# CLOUDFLARE / ACME
+# Cloudflare
 ########################################
 
 def prompt_cloudflare(state):
-    """
-    Prompt user for Cloudflare integration details, store in state.
-    """
+    log("[INFO] Prompting user for Cloudflare DNS/SSL setup.")
     print("""
 Cloudflare Integration
 ----------------------
 We can use acme.sh with Cloudflare DNS API to issue Let's Encrypt certificates automatically.
 """)
-    choice = input("Do you want to configure Cloudflare SSL? (y/n): ").strip().lower()
-    if choice != 'y':
-        print("[INFO] Skipping Cloudflare integration.")
+    c = input("Configure Cloudflare SSL? (y/n): ").strip().lower()
+    if c != 'y':
         return
 
     api_token = input("Enter your Cloudflare API Token: ").strip()
     domain = input("Enter your domain (e.g. example.com): ").strip()
     subdomain = input("Subdomain? (leave empty if root domain): ").strip()
 
-    state['cloudflare'] = {
-        'api_token': api_token,
-        'domain': domain,
-        'subdomain': subdomain
-    }
-    print("[INFO] Cloudflare info stored. Use 'Issue/Install SSL Certificate' from the menu to proceed.")
+    # store in state, but not in JSON
+    state['api_token'] = api_token
+    state['cloudflare_domain'] = domain
+    state['cloudflare_subdomain'] = subdomain
 
 def setup_cloudflare_ssl(state):
-    """
-    Use acme.sh + DNS-01 challenge with CF token for SSL.
-    """
-    if 'cloudflare' not in state or not state['cloudflare'].get('api_token'):
-        print("[Error] Cloudflare not configured. Go to 'Configure Domain / Cloudflare' first.")
+    log("[INFO] Setting up Cloudflare-based SSL via acme.sh.")
+    api_token = state.get('api_token')
+    domain = state.get('cloudflare_domain')
+    subdomain = state.get('cloudflare_subdomain')
+    if not api_token or not domain:
+        log("[ERROR] Cloudflare not configured (token/domain missing).")
         return
 
-    api_token = state['cloudflare']['api_token']
-    domain = state['cloudflare']['domain']
-    subdomain = state['cloudflare']['subdomain']
-    if not domain:
-        print("[Error] Domain is missing. Please re-enter Cloudflare info.")
-        return
-
-    # Install acme.sh if not present
-    print("\n[INFO] Installing acme.sh (if not installed)...")
     run_cmd("apt install -y socat")
     run_cmd("curl https://get.acme.sh | sh -s email=my@example.com")
 
+    full_domain = domain
+    if subdomain:
+        full_domain = f"{subdomain}.{domain}"
+
     os.environ["CF_Token"] = api_token
+    run_cmd(f"~/.acme.sh/acme.sh --issue --dns dns_cf -d {full_domain}")
 
-    full_domain = f"{subdomain}.{domain}" if subdomain else domain
-    print(f"[INFO] Issuing certificate for {full_domain} via acme.sh (DNS-01 challenge)...")
-
-    acme_cmd = f"~/.acme.sh/acme.sh --issue --dns dns_cf -d {full_domain}"
-    run_cmd(acme_cmd)
-
-    # Install the certificate to /etc/letsencrypt/odoo:
     run_cmd("mkdir -p /etc/letsencrypt/")
-    install_cmd = (f"~/.acme.sh/acme.sh --install-cert -d {full_domain} "
-                   f"--key-file /etc/letsencrypt/odoo.key "
-                   f"--fullchain-file /etc/letsencrypt/odoo.crt "
-                   f"--reloadcmd \"systemctl reload nginx\"")
-    run_cmd(install_cmd)
-
-    print(f"[OK] SSL certificate installed for {full_domain} in /etc/letsencrypt.")
+    cmd = (f"~/.acme.sh/acme.sh --install-cert -d {full_domain} "
+           f"--key-file /etc/letsencrypt/odoo.key "
+           f"--fullchain-file /etc/letsencrypt/odoo.crt "
+           f"--reloadcmd \"systemctl reload nginx\"")
+    run_cmd(cmd)
+    log(f"[OK] SSL certificate installed for {full_domain} in /etc/letsencrypt.")
 
 ########################################
-# NGINX CONFIG
+# Nginx
 ########################################
 
 def configure_nginx(state):
-    """
-    Configure or update an Nginx reverse proxy for Odoo with SSL.
-    """
-    print("""
-Nginx Reverse Proxy Setup
--------------------------
-""")
-    choice = input("Do you want to configure Nginx now? (y/n): ").strip().lower()
-    if choice != 'y':
-        print("[INFO] Skipping Nginx configuration.")
+    log("[INFO] Configuring Nginx reverse proxy for Odoo.")
+    c = input("Do you want to configure Nginx now? (y/n): ").strip().lower()
+    if c != 'y':
         return
 
-    domain = ""
-    if 'cloudflare' in state:
-        domain_part = state['cloudflare']['domain']
-        subdomain_part = state['cloudflare']['subdomain']
-        domain = f"{subdomain_part}.{domain_part}" if subdomain_part else domain_part
-
-    if not domain:
+    domain = state.get('cloudflare_domain', '')
+    subd = state.get('cloudflare_subdomain', '')
+    if domain:
+        if subd:
+            domain = f"{subd}.{domain}"
+    else:
         domain = input("Enter domain name (e.g. odoo.example.com): ").strip()
 
-    if not domain or domain == ".":
-        print("[Error] Invalid domain.")
+    if not domain:
+        log("[ERROR] Invalid domain name.")
         return
 
     config_path = "/etc/nginx/sites-available/odoo"
@@ -659,7 +648,6 @@ server {{
     ssl_certificate /etc/letsencrypt/odoo.crt;
     ssl_certificate_key /etc/letsencrypt/odoo.key;
 
-    # Proxy buffers
     proxy_buffers 16 64k;
     proxy_buffer_size 128k;
 
@@ -686,108 +674,93 @@ server {{
 
     run_cmd(f"ln -sf {config_path} /etc/nginx/sites-enabled/odoo")
     run_cmd("systemctl restart nginx")
-    print(f"[OK] Nginx reverse proxy configured for {domain}.")
+    log(f"[OK] Nginx reverse proxy configured for {domain}.")
 
 ########################################
-# SSH HARDENING
+# SSH Hardening
 ########################################
 
 def harden_ssh():
-    print("""
-SSH Hardening
--------------
-""")
-    choice = input("Do you want to harden SSH? (y/n): ").strip().lower()
-    if choice != 'y':
+    log("Prompting for SSH hardening.")
+    c = input("Do you want to harden SSH? (y/n): ").strip().lower()
+    if c != 'y':
         return
 
-    pub_key = input("Paste your public SSH key (e.g. ssh-rsa AAAAB3...):\n").strip()
-    if not pub_key.startswith("ssh-"):
-        print("[Warning] That doesn't look like a valid SSH key. Skipping.")
+    pub = input("Paste your public SSH key (e.g. ssh-rsa AAAAB3...):\n").strip()
+    if not pub.startswith("ssh-"):
+        log("[WARN] That doesn't look like a valid SSH key. Skipping.")
         return
 
-    ssh_user = input("Which user do you want to add the key for? (default: root): ").strip()
-    if not ssh_user:
-        ssh_user = "root"
+    ssh_user = input("Which user do you want to add the key for? (default: root): ").strip() or "root"
+    home_dir = "/root" if ssh_user == "root" else f"/home/{ssh_user}"
+    ssh_dir = os.path.join(home_dir, ".ssh")
 
-    user_home = f"/home/{ssh_user}" if ssh_user != "root" else "/root"
-    ssh_dir = os.path.join(user_home, ".ssh")
     run_cmd(f"mkdir -p {ssh_dir}")
-    auth_keys_path = os.path.join(ssh_dir, "authorized_keys")
-
-    with open(auth_keys_path, 'a') as f:
-        f.write(pub_key + "\n")
+    auth_file = os.path.join(ssh_dir, "authorized_keys")
+    try:
+        with open(auth_file, 'a') as f:
+            f.write(pub + "\n")
+    except Exception as e:
+        log(f"[ERROR] Could not write key to {auth_file}: {e}")
+        return
 
     run_cmd(f"chown -R {ssh_user}:{ssh_user} {ssh_dir}")
     run_cmd(f"chmod 700 {ssh_dir}")
-    run_cmd(f"chmod 600 {auth_keys_path}")
+    run_cmd(f"chmod 600 {auth_file}")
 
-    disable_choice = input("Disable password login? (y/n): ").strip().lower()
-    if disable_choice == 'y':
+    disable_pass = input("Disable password login? (y/n): ").strip().lower()
+    if disable_pass == 'y':
         sshd_config = "/etc/ssh/sshd_config"
-        with open(sshd_config, 'r') as f:
-            lines = f.readlines()
-        new_lines = []
-        for line in lines:
-            if line.strip().startswith("PasswordAuthentication"):
-                new_lines.append("PasswordAuthentication no\n")
-            else:
-                new_lines.append(line)
-        with open(sshd_config, 'w') as f:
-            f.write("".join(new_lines))
-        run_cmd("systemctl restart sshd")
-        print("[OK] Password login disabled. Make sure your SSH key works!")
+        try:
+            with open(sshd_config, 'r') as f:
+                lines = f.readlines()
+            new_lines = []
+            for line in lines:
+                if line.strip().startswith("PasswordAuthentication"):
+                    new_lines.append("PasswordAuthentication no\n")
+                else:
+                    new_lines.append(line)
+            with open(sshd_config, 'w') as f:
+                f.write("".join(new_lines))
+            run_cmd("systemctl restart sshd")
+            log("[OK] Password login disabled. Ensure your SSH key works!")
+        except Exception as e:
+            log(f"[ERROR] Could not edit sshd_config: {e}")
 
 ########################################
-# FIREWALL (UFW) SETUP
+# Firewall
 ########################################
 
 def configure_firewall():
+    log("Prompting for UFW firewall config.")
     print("""
 UFW Firewall Configuration
 --------------------------
-We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and optionally 8069 for Odoo direct access.
+We'll open ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and optionally 8069 for direct Odoo.
 """)
-    choice = input("Do you want to install and configure UFW? (y/n): ").strip().lower()
-    if choice != 'y':
+    c = input("Install & enable UFW? (y/n): ").strip().lower()
+    if c != 'y':
         return
 
     run_cmd("apt install -y ufw")
 
-    # Basic rules
     run_cmd("ufw allow 22")
     run_cmd("ufw allow 80")
     run_cmd("ufw allow 443")
-
-    # Option to open Odoo port directly
-    odoo_port_choice = input("Open Odoo port 8069? (y/n): ").strip().lower()
-    if odoo_port_choice == 'y':
+    ch = input("Open Odoo port 8069? (y/n): ").strip().lower()
+    if ch == 'y':
         run_cmd("ufw allow 8069")
 
     run_cmd("ufw enable")
     run_cmd("ufw status")
-    print("[OK] UFW firewall configured.")
+    log("[OK] UFW firewall configured.")
 
 ########################################
-# FULL WIZARD
+# Full Wizard
 ########################################
 
 def run_full_wizard(state):
-    """
-    Run all steps in a typical sequence:
-    1. Check/upgrade Python
-    2. Install dependencies (including Node.js/wkhtmltopdf)
-    3. Configure DB
-    4. Clone and install Odoo 18
-    5. Memory config for Odoo workers
-    6. Configure Odoo
-    7. Create systemd service
-    8. Prompt for CF SSL
-    9. Issue CF SSL
-    10. Configure Nginx
-    11. SSH Hardening
-    12. Firewall
-    """
+    log("Running full wizard.")
     check_python_version()
     prompt_install_dependencies()
     configure_database(state)
@@ -800,36 +773,33 @@ def run_full_wizard(state):
     configure_nginx(state)
     harden_ssh()
     configure_firewall()
-
-    print("\n[Installation Complete]")
-    print("=========================================")
-    print("Odoo 18 should now be running on port 8069. If you configured")
-    print("Nginx and SSL, your domain should serve Odoo over HTTPS.")
-    print("=========================================")
+    log("[INSTALLATION COMPLETE] Odoo 18 is presumably running on port 8069 with Nginx SSL if configured.")
+    print("\n[Installation Complete]\n")
 
 ########################################
-# MAIN MENU
+# Main Menu
 ########################################
 
 def main_menu(state):
     while True:
+        save_state(state)  # Always save after each action
         print("""
-=================================
- Main Menu
-=================================
-1) Full Odoo 18 Installation (Wizard)
-2) Install Dependencies (Nodejs, Wkhtml, etc.)
-3) Database Setup/Update
-4) Odoo Setup/Update (Clone & Python deps)
-5) Odoo Memory Config (Workers)
+==================================
+ Odoo 18 Installation Main Menu
+==================================
+1) Full Odoo 18 Installation Wizard
+2) Install Dependencies
+3) Configure PostgreSQL DB
+4) Setup/Update Odoo (Clone & Venv)
+5) Memory Worker Config for Odoo
 6) Configure Odoo (Write /etc/odoo.conf)
-7) Create/Update Odoo Systemd Service
-8) Configure Domain / Cloudflare
-9) Issue/Install SSL Certificate
+7) Create Odoo systemd service
+8) Cloudflare Domain/SSL Setup
+9) Issue/Install SSL Certificate (acme.sh)
 10) Configure Nginx Reverse Proxy
 11) SSH Hardening
-12) Configure Firewall
-13) Advanced PostgreSQL Tuning (Separate)
+12) Firewall Setup
+13) Advanced PostgreSQL Tuning
 14) Exit
 """)
         choice = input("Select an option: ").strip()
@@ -860,21 +830,21 @@ def main_menu(state):
         elif choice == "13":
             advanced_postgres_tuning()
         elif choice == "14":
-            print("[INFO] Exiting.")
+            log("[INFO] Exiting script.")
             break
         else:
-            print("[Warning] Invalid choice. Please select again.")
+            print("[WARN] Invalid choice. Please select again.")
 
 def main():
-    print_ascii_banner()
+    ensure_dir(os.path.dirname(LOG_FILE))  # ensure /var/log/ exists
     check_root()
     detect_ubuntu()
 
-    # We store dynamic states here, e.g. DB info, domain, memory settings, etc.
-    state = {}
-
+    # load or init state
+    state = load_state()
     main_menu(state)
-    print("\n[Done] Thanks for using the Odoo 18 Setup & Management Tool!\n")
+    save_state(state)
+    print("\n[Done] Odoo 18 Setup Script Exiting.\n")
 
 if __name__ == "__main__":
     main()
