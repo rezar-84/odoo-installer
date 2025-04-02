@@ -17,11 +17,11 @@ LOG_FILE = "/var/log/odoo_install.log"
 
 def print_ascii_banner():
     banner = r"""
-   ____  ____          __
-  / __ \/ __ \___  ___/ /
- / / / / /_/ / _ \/ _  / 
-/ /_/ / _, _/  __/ __/  
-\____/_/ |_|\___/_/     
+   ____  ____  ____  ____ 
+  / __ \/ __ \/ __ \/ __ \
+ / / / / / / / / / / / / / 
+/ /_/ / /_/ / /_/ / /_/ /  
+\____/_____|\____/_____/     
    O D O O   W i z a r d
 
 ====================================
@@ -142,23 +142,15 @@ def user_exists(user_name):
 ########################################
 
 def apt_install(pkg_list):
-    """
-    Attempt 'apt install -y <pkg_list>'.
-    If it fails, we detect the return code. If it's code 100 (broken packages),
-    we prompt the user about trying 'apt --fix-broken install -y', then re-attempt.
-    Returns True if final install is successful, False otherwise.
-    """
     stdout, stderr, rc = run_cmd(f"apt install -y {pkg_list}", capture_output=True)
     if rc == 0:
         return True
-
     if rc == 100:
         log("[ERROR] apt install encountered broken packages. Attempt fix-broken approach?")
         fix_choice = input("Attempt 'apt --fix-broken install'? (y/n): ").strip().lower()
         if fix_choice == 'y':
             _, _, rc2 = run_cmd("apt --fix-broken install -y", capture_output=True)
             if rc2 == 0:
-                # re-attempt original
                 _, _, rc3 = run_cmd(f"apt install -y {pkg_list}", capture_output=True)
                 if rc3 == 0:
                     return True
@@ -172,8 +164,27 @@ def apt_install(pkg_list):
             log("[WARN] Skipping fix-broken. apt install remains failed.")
             return False
     else:
-        log(f"[ERROR] apt install of {pkg_list} failed with code {rc}. No fix-broken attempt.")
+        log(f"[ERROR] apt install of {pkg_list} failed with code {rc}.")
         return False
+
+########################################
+# State: Odoo Path
+########################################
+
+def prompt_odoo_path(state):
+    if 'odoo_path' in state and os.path.isdir(state['odoo_path']):
+        print(f"[INFO] Odoo path already set: {state['odoo_path']}")
+        c = input("Change path? (y/n): ").strip().lower()
+        if c != 'y':
+            return
+    new_path = input("Enter Odoo installation path (e.g. /opt/odoo18): ").strip() or "/opt/odoo18"
+    state['odoo_path'] = new_path
+    parent = os.path.dirname(new_path)
+    if parent:
+        run_cmd(f"mkdir -p {parent}")
+    run_cmd(f"mkdir -p {new_path}")
+    log(f"[INFO] Odoo path set to {new_path}")
+
 
 ########################################
 # Step: Install / Upgrade Python
@@ -265,7 +276,6 @@ We'll install required packages for Odoo 18 on Ubuntu 24.04, including:
 - PostgreSQL and dev libs
 - libpq-dev, libxml2-dev, libxslt1-dev, zlib1g-dev, libjpeg-dev
 - nginx, xfonts-75dpi, xfonts-base
-- nodejs, npm, yarn
 - wkhtmltopdf
 
 Install dependencies now?
@@ -289,8 +299,8 @@ Install dependencies now?
         log("[ERROR] Base dependencies failed to install. Some steps may fail later.")
         return
 
-    # NodeSource script for Node 18
-    stdout, stderr, rc = run_cmd("curl -sL https://deb.nodesource.com/setup_18.x | bash -", capture_output=True)
+    # NodeSource script for Node 
+    stdout, stderr, rc = run_cmd("curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -", capture_output=True)
     if rc != 0:
         log("[ERROR] NodeSource setup script failed. Node.js won't install. Aborting node steps.")
         return
@@ -720,7 +730,7 @@ We can use acme.sh with Cloudflare DNS API to issue Let's Encrypt certificates a
 def setup_cloudflare_ssl(state):
     log("[INFO] Setting up Cloudflare-based SSL via acme.sh.")
     api_token = state.get('api_token')
-    domain = state.get('cloudflare_domain')
+    domain = state.get('cloudflare_domainn')
     subdomain = state.get('cloudflare_subdomain')
     if not api_token or not domain:
         log("[ERROR] Cloudflare not configured (token/domain missing).")
